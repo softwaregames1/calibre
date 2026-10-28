@@ -6,11 +6,12 @@ Test the CLI of the calibre database management tool
 """
 
 import csv
+import json
 import os
 import shutil
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
+from io import BytesIO, StringIO
 
 from calibre.db.cli.cmd_check_library import _print_check_library_results
 from calibre.db.cli.cmd_list_categories import do_list
@@ -463,6 +464,90 @@ class ItemsTest(BaseTest):
         self.assertEqual(len(changes), 1)
 
 
+class DataFilesTest(BaseTest):
+    def run_data_files(self, db, *args, is_remote=False):
+        from calibre.db.cli.cmd_data_files import implementation, main, option_parser
+        from calibre.db.cli.main import get_parser
+        from calibre.utils.serialize import msgpack_dumps, msgpack_loads
+
+        class DBCtx:
+            def run(self, name, *args):
+                if is_remote:
+                    # Results are sent over the network by the Content server
+                    return msgpack_loads(msgpack_dumps(implementation(db, lambda *a: None, *msgpack_loads(msgpack_dumps(args)))))
+                return implementation(db, None, *args)
+
+        opts, args = option_parser(get_parser, []).parse_args(list(args))
+        with redirect_stdout(StringIO()) as out:
+            main(opts, args, DBCtx())
+        return out.getvalue()
+
+    def test_data_files(self):
+        db = self.init_cache()
+        self.addCleanup(db.close)
+        db.add_extra_files(1, {'data/a.txt': BytesIO(b'aaa'), 'data/sub/b.txt': BytesIO(b'bb')})
+        db.add_extra_files(2, {'data/c.txt': BytesIO(b'c')})
+
+        def names(book_id):
+            return [x.split('\t')[0] for x in self.run_data_files(db, 'list', str(book_id)).splitlines()]
+
+        self.assertEqual(names(1), ['a.txt', 'sub/b.txt'])
+        self.assertEqual(names(3), [])
+        self.assertEqual(self.run_data_files(db, 'list', '1').splitlines()[0].split('\t')[1], '3')
+        listed = json.loads(self.run_data_files(db, 'list', '--for-machine', '1'))
+        self.assertEqual([(x['name'], x['size']) for x in listed], [('a.txt', 3), ('sub/b.txt', 2)])
+
+        dest = os.path.join(self.library_path, 'extracted')
+        os.mkdir(dest)
+        for is_remote in (False, True):
+            with self.subTest(is_remote=is_remote):
+                out = self.run_data_files(db, 'extract', '--to', dest, '1', 'sub/b.txt', is_remote=is_remote).strip()
+                self.assertEqual(out, os.path.join(dest, 'b.txt'))
+                with open(out, 'rb') as f:
+                    self.assertEqual(f.read(), b'bb')
+                with self.assertRaisesRegex(SystemExit, 'already exists'):
+                    self.run_data_files(db, 'extract', '--to', dest, '1', 'sub/b.txt', is_remote=is_remote)
+                self.run_data_files(db, 'extract', '--replace', '--to', os.path.join(dest, 'x.txt'), '1', 'a.txt', is_remote=is_remote)
+                with open(os.path.join(dest, 'x.txt'), 'rb') as f:
+                    self.assertEqual(f.read(), b'aaa')
+                os.remove(os.path.join(dest, 'b.txt'))
+
+        self.run_data_files(db, 'rename', '1', 'sub/b.txt', 'b.txt')
+        self.assertEqual(names(1), ['a.txt', 'b.txt'])
+        with self.assertRaisesRegex(SystemExit, 'already exists'):
+            self.run_data_files(db, 'rename', '1', 'a.txt', 'b.txt')
+        self.run_data_files(db, 'rename', '--replace', '1', 'a.txt', 'b.txt')
+        self.assertEqual(names(1), ['b.txt'])
+        self.run_data_files(db, 'rename', '1', 'b.txt', 'new/b.txt', is_remote=True)
+        self.assertEqual(names(1), ['new/b.txt'])
+
+        self.assertEqual(self.run_data_files(db, 'remove', '--permanent', '1', 'new/b.txt'), '1 data files removed\n')
+        self.assertEqual(names(1), [])
+        self.assertEqual(self.run_data_files(db, 'remove', '2', 'c.txt', is_remote=True), '1 data files removed\n')
+        self.assertEqual(names(2), [])
+
+        db.add_extra_files(1, {'data/a.txt': BytesIO(b'aaa')})
+        for args, msg in (
+            ((), 'must specify an action'),
+            (('frob', '1'), 'not recognized'),
+            (('list', 'x'), 'must be a number'),
+            (('list', '99'), 'No book with id'),
+            (('list', '1', 'a.txt'), 'Too many arguments'),
+            (('extract', '1'), 'one data file'),
+            (('extract', '--to', dest, '1', 'missing.txt'), 'no data files named: missing.txt'),
+            (('rename', '1', 'a.txt'), 'its new name'),
+            (('rename', '1', 'a.txt', '../a.txt'), 'Not a valid data file name'),
+            (('rename', '1', 'a.txt', '/tmp/a.txt'), 'Not a valid data file name'),
+            (('remove', '1'), 'names of the data files'),
+            (('remove', '1', '../metadata.opf'), 'Not a valid data file name'),
+            (('remove', '1', 'a.txt', 'missing.txt'), 'no data files named: missing.txt'),
+        ):
+            with self.subTest(args=args), self.assertRaisesRegex(SystemExit, msg):
+                self.run_data_files(db, *args)
+        # Nothing is removed if any of the files does not exist
+        self.assertEqual(names(1), ['a.txt'])
+
+
 def find_tests():
     loader = unittest.defaultTestLoader
     return unittest.TestSuite((
@@ -473,4 +558,5 @@ def find_tests():
         loader.loadTestsFromTestCase(NotesTest),
         loader.loadTestsFromTestCase(RestoreDatabaseTest),
         loader.loadTestsFromTestCase(ItemsTest),
+        loader.loadTestsFromTestCase(DataFilesTest),
     ))
