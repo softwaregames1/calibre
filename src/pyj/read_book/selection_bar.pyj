@@ -8,7 +8,7 @@ from uuid import short_uuid
 
 from book_list.globals import get_session_data
 from book_list.theme import get_color
-from dom import change_icon_image, clear, svgicon, unique_id
+from dom import add_extra_css, build_rule, button_space_key_event, change_icon_image, clear, cycle_focus, svgicon, unique_id
 from modals import create_custom_dialog, error_dialog, question_dialog
 from read_book.globals import runtime, ui_operations
 from read_book.highlights import (
@@ -22,6 +22,12 @@ from widgets import create_button
 
 DRAG_SCROLL_ZONE_MIN_HEIGHT = 10
 BUTTON_MARGIN = '0.5rem'
+BUTTON_CLASS = 'selection-bar-button'
+
+add_extra_css(def ():
+    return build_rule('.' + BUTTON_CLASS + ':focus', outline='none') + build_rule(
+        '.' + BUTTON_CLASS + ':focus-visible', outline='2px solid currentColor', outline_offset='2px')
+)
 
 # Utils {{{
 
@@ -270,6 +276,8 @@ class SelectionBar:
         container.addEventListener('keydown', self.on_keydown, {'passive': False})
         container.addEventListener('wheel', self.on_wheel, {'passive': False})
         container.setAttribute('tabindex', '0')
+        container.setAttribute('role', 'group')
+        container.setAttribute('aria-label', _('Selected text. Press Tab to choose an action.'))
 
         self.dragging_handle = None
         self.position_in_handle = {'x': 0, 'y': 0}
@@ -278,6 +286,7 @@ class SelectionBar:
         self.last_drag_scroll_at = None
         self.start_line_length = self.end_line_length = 0
         self.current_editor = None
+        self.last_toolbar_key = None
 
         start_handle = selection_handle()
         start_handle.id = self.start_handle_id
@@ -306,9 +315,28 @@ class SelectionBar:
         for h in (self.start_handle, self.end_handle):
             set_handle_color(h, handle_fill, fg)
 
+    def make_toolbar_button(self, elem, key, name):
+        # Buttons are reached with Tab and moved between with the arrow keys,
+        # see handle_toolbar_key()
+        elem.setAttribute('role', 'button')
+        elem.setAttribute('aria-label', name)
+        elem.setAttribute('tabindex', '-1')
+        elem.dataset.toolbarKey = key
+        elem.classList.add(BUTTON_CLASS)
+        for event_name in ('keydown', 'keyup', 'blur'):
+            elem.addEventListener(event_name, button_space_key_event)
+        return elem
+
+    def toolbar_buttons(self):
+        return [b for b in self.bar.querySelectorAll('[data-toolbar-key]')]
+
     def build_bar(self, annot_id):
         notes = self.annotations_manager.notes_for_highlight(annot_id)
         bar_container = self.bar
+        # The bar is rebuilt whenever the selection changes, such as after a
+        # quick highlight, so keep focus on the same button
+        focused = document.activeElement
+        refocus = focused.dataset.toolbarKey if focused and bar_container.contains(focused) else None
         clear(bar_container)
         bar_container.style.maxWidth = 'min(50rem, 90vw)'
         bar_container.style.backgroundColor = get_color('window-background')
@@ -324,14 +352,21 @@ class SelectionBar:
         ]:
             bar_container.appendChild(x)
         bar = bar_container.firstChild
+        bar.setAttribute('role', 'toolbar')
+        bar.setAttribute('aria-label', _('Actions for the selected text'))
         hs = self.current_highlight_style.highlight_shade(self.view.current_color_scheme.is_dark_theme)
 
-        def cb(ac, callback):
-            ans = ac.icon_function(hs)
+        def cb(acname, ac, callback):
+            # Most icons are <svg>, which cannot be clicked from scripts, as
+            # pressing Enter or Space does, so put them in a <div>
+            ans = self.make_toolbar_button(E.div(style='display: flex; align-items: center', ac.icon_function(hs)), acname, ac.text)
             ans.addEventListener('click', def (ev):
                 ev.stopPropagation(), ev.preventDefault()
                 callback(ev)
-                self.view.focus_iframe()
+                # Activated with the keyboard, keep focus on the button, or the
+                # one replacing it if the bar was rebuilt
+                if ev.detail is not 0 or not self.bar.contains(document.activeElement):
+                    self.view.focus_iframe()
             )
             ans.classList.add('simple-link')
             ans.style.marginLeft = ans.style.marginRight = BUTTON_MARGIN
@@ -342,12 +377,18 @@ class SelectionBar:
         for acname in sd.get('selection_bar_actions'):
             ac = actions[acname]
             if ac and (not ac.needs_highlight or v'!!annot_id'):
-                bar.appendChild(cb(ac, self[ac.function_name]))
+                bar.appendChild(cb(acname, ac, self[ac.function_name]))
         selection_bar_quick_highlights = sd.get('selection_bar_quick_highlights')
         self.quick_highlight_styles = []
         if selection_bar_quick_highlights?.length:
             self.show_quick_highlight_buttons(bar, selection_bar_quick_highlights)
         self.show_notes(bar_container, notes)
+        if refocus:
+            matches = [b for b in self.toolbar_buttons() if b.dataset.toolbarKey is refocus]
+            if matches.length:
+                matches[0].focus()
+            else:
+                self.focus()
         return bar_container
 
     def show_quick_highlight_buttons(self, bar, actions):
@@ -358,6 +399,7 @@ class SelectionBar:
         actions.pysort(key=def (a): return (all[a].friendly_name or '').toLowerCase();)
         self.quick_highlight_styles = actions
         bar.appendChild(E.div(
+            role='separator', aria_orientation='vertical',
             style=f'background: currentColor; width: 1px; height: {ICON_SIZE}; margin-left: {BUTTON_MARGIN}; margin-right: {BUTTON_MARGIN}'
         ))
         dark = self.view.current_color_scheme.is_dark_theme
@@ -369,12 +411,18 @@ class SelectionBar:
                 sc = 0
             else:
                 sc = None
+            title = _('Highlight using: {name}{sc}').format(name=hs.friendly_name, sc=f' [{sc}]' if sc is not None else '')
             sw = E.div(
                 class_='simple-link', style=f'margin-left: {BUTTON_MARGIN}; margin-right: {BUTTON_MARGIN}',
-                title=_('Highlight using: {name}{sc}').format(name=hs.friendly_name, sc=f' [{sc}]' if sc is not None else ''),
-                onclick=self.quick_highlight_with_style.bind(None, hs),
+                title=title, onclick=self.quick_highlight_with_style.bind(None, hs),
             )
             hs.make_swatch(sw, dark)
+            self.make_toolbar_button(sw, 'quick-highlight-' + key, title)
+            sw.addEventListener('click', def (ev):
+                # Clicked with the mouse, leave focus to the viewer, as before
+                if ev.detail is not 0 and self.is_visible:
+                    self.focus()
+            )
             bar.appendChild(sw)
 
     def show_notes(self, bar, notes):
@@ -586,8 +634,48 @@ class SelectionBar:
         if self.state is not EDITING:
             self.view.send_wheel_event_to_iframe(ev, 'selection-mode')
 
+    def handle_toolbar_key(self, ev):
+        # Tab moves focus into the toolbar of actions, to the button that last
+        # had focus, and out of it again. In the toolbar the arrow keys, Home and
+        # End move between buttons. Other keys, such as the letter shortcuts,
+        # work as when the toolbar does not have focus.
+        if ev.ctrlKey or ev.altKey or ev.metaKey:
+            return False
+        buttons = self.toolbar_buttons()
+        if not buttons.length:
+            return False
+        idx = buttons.indexOf(document.activeElement)
+        if ev.key is 'Tab':
+            if idx > -1:
+                self.last_toolbar_key = buttons[idx].dataset.toolbarKey
+                self.focus()
+                return True
+            for b in buttons:
+                if b.dataset.toolbarKey is self.last_toolbar_key:
+                    b.focus()
+                    return True
+            buttons[buttons.length - 1 if ev.shiftKey else 0].focus()
+            return True
+        if idx < 0:
+            return False
+        if ev.key is 'ArrowRight' or ev.key is 'ArrowDown':
+            cycle_focus(buttons, False)
+        elif ev.key is 'ArrowLeft' or ev.key is 'ArrowUp':
+            cycle_focus(buttons, True)
+        elif ev.key is 'Home':
+            buttons[0].focus()
+        elif ev.key is 'End':
+            buttons[buttons.length - 1].focus()
+        elif ev.key is 'Enter':
+            buttons[idx].click()
+        else:
+            return False
+        return True
+
     def on_keydown(self, ev):
         ev.stopPropagation(), ev.preventDefault()
+        if self.state is WAITING and self.handle_toolbar_key(ev):
+            return
         if ev.key is 'Escape':
             if self.state is EDITING:
                 self.hide_editor()

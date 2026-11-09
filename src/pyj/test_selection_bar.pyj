@@ -1,0 +1,144 @@
+# vim:fileencoding=utf-8
+# License: GPL v3 Copyright: 2026, Kovid Goyal <kovid at kovidgoyal.net>
+from __python__ import hash_literals
+
+from elementmaker import E
+
+from read_book.highlights import HighlightStyle, custom_color_theme
+from read_book.selection_bar import WAITING, SelectionBar
+from test_book_list_helpers import with_empty_session
+from testing import assert_equal, assert_false, assert_true, test
+
+
+def press(elem, key, kind, kw):
+    ev = new window.KeyboardEvent(kind or 'keydown', Object.assign({'key': key, 'bubbles': True, 'cancelable': True}, kw))
+    elem.dispatchEvent(ev)
+    return ev
+
+
+def create_bar(calls):
+    overlay = E.div(id='book-selection-bar-overlay')
+    document.body.appendChild(overlay)
+    view = {
+        'current_color_scheme': {'is_dark_theme': False, 'foreground': 'black'},
+        'annotations_manager': {'notes_for_highlight': def ():
+            return ''
+        },
+        'keyboard_shortcut_map': {},
+    }
+    sb = SelectionBar(view)
+    # Like the viewer, which focuses the visible selection bar
+    view.focus_iframe = def ():
+        sb.focus()
+
+    def record(name):
+        return def ():
+            calls.push(name)
+
+    for name in ('copy_to_clipboard', 'lookup', 'clear_selection', 'quick_highlight_with_style'):
+        sb[name] = record(name)
+    overlay.style.display = sb.bar.style.display = 'block'
+    sb.state = WAITING
+    sb.build_bar(None)
+    return sb
+
+
+@test
+def selection_bar_actions_are_a_named_toolbar_of_buttons():
+    def run(sd):
+        theme = custom_color_theme('Sunny', '#ffff00', '#808000')
+        sd.set('custom_highlight_styles', [theme])
+        style = HighlightStyle(theme)
+        sd.set('selection_bar_actions', ['copy', 'lookup', 'clear'])
+        sd.set('selection_bar_quick_highlights', [style.key])
+        sb = create_bar([])
+        try:
+            assert_equal(sb.container.getAttribute('role'), 'group')
+            assert_true('Tab' in sb.container.getAttribute('aria-label'))
+            toolbar = sb.bar.querySelector('[role=toolbar]')
+            assert_equal(toolbar.getAttribute('aria-label'), 'Actions for the selected text')
+            buttons = sb.toolbar_buttons()
+            assert_equal(buttons.length, 4)
+            for b in buttons:
+                assert_equal(b.getAttribute('role'), 'button')
+                assert_equal(b.getAttribute('tabindex'), '-1')
+                assert_true(toolbar.contains(b))
+            assert_equal(buttons[0].getAttribute('aria-label'), 'Copy to clipboard [Ctrl+C]')
+            assert_equal(buttons[2].getAttribute('aria-label'), 'Clear selection [Esc]')
+            assert_equal(buttons[3].getAttribute('aria-label'), 'Highlight using: Sunny [1]')
+            assert_equal(toolbar.querySelector('[role=separator]').getAttribute('aria-orientation'), 'vertical')
+        finally:
+            sb.container.remove()
+
+    with_empty_session(run)
+
+
+@test
+def selection_bar_toolbar_is_used_with_tab_arrows_enter_and_space():
+    def run(sd):
+        sd.set('selection_bar_actions', ['copy', 'lookup', 'clear'])
+        sd.set('selection_bar_quick_highlights', [])
+        calls = []
+        sb = create_bar(calls)
+        try:
+            container = sb.container
+            copy, lookup, clear = sb.toolbar_buttons()
+
+            def focused():
+                return document.activeElement
+
+            sb.focus()
+            # Tab moves into the toolbar, and out of it again
+            assert_true(press(container, 'Tab').defaultPrevented)
+            assert_equal(focused(), copy)
+            press(focused(), 'Tab')
+            assert_equal(focused(), container)
+            press(container, 'Tab', 'keydown', {'shiftKey': True})
+            assert_equal(focused(), copy)
+
+            # Arrow keys, wrapping around, Home and End move between buttons
+            press(focused(), 'ArrowRight')
+            assert_equal(focused(), lookup)
+            press(focused(), 'End')
+            assert_equal(focused(), clear)
+            press(focused(), 'ArrowRight')
+            assert_equal(focused(), copy)
+            press(focused(), 'ArrowLeft')
+            assert_equal(focused(), clear)
+            press(focused(), 'Home')
+            assert_equal(focused(), copy)
+
+            # Tab returns to the button that last had focus
+            press(focused(), 'ArrowRight')
+            press(focused(), 'Tab')
+            press(container, 'Tab')
+            assert_equal(focused(), lookup)
+
+            # Enter and Space activate the focused button, which keeps focus
+            press(focused(), 'Enter')
+            assert_equal(calls, ['lookup'])
+            assert_equal(focused(), lookup)
+            assert_true(press(focused(), ' ').defaultPrevented)
+            press(focused(), ' ', 'keyup')
+            assert_equal(calls, ['lookup', 'lookup'])
+            assert_equal(focused(), lookup)
+
+            # Shortcuts still work in the toolbar
+            press(focused(), 'Escape')
+            assert_equal(calls, ['lookup', 'lookup', 'clear_selection'])
+
+            # Rebuilding the bar, as when the selection changes, keeps focus on
+            # the same button
+            sb.build_bar(None)
+            assert_false(lookup.isConnected)
+            assert_equal(focused().dataset.toolbarKey, 'lookup')
+
+            # A mouse click leaves focus to the viewer, as before
+            copy = sb.toolbar_buttons()[0]
+            copy.dispatchEvent(new window.MouseEvent('click', {'bubbles': True, 'cancelable': True, 'detail': 1}))
+            assert_equal(calls[calls.length - 1], 'copy_to_clipboard')
+            assert_equal(focused(), container)
+        finally:
+            sb.container.remove()
+
+    with_empty_session(run)
