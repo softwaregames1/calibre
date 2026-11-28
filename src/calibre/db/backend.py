@@ -1615,7 +1615,7 @@ class DB:
         return changed
 
     def create_custom_column(
-        self, label: str, name: str, datatype: str, is_multiple: bool, editable: bool = True, display: JSONDict | None = None
+        self, label: str, name: str, datatype: str, is_multiple: bool, editable: bool = True, display: Mapping[str, object] | None = None
     ) -> int:  # {{{
         import re
 
@@ -2226,7 +2226,7 @@ class DB:
         if callable(getattr(data, 'save', None)):
             from calibre.gui2 import pixmap_to_data
 
-            data = pixmap_to_data(data)
+            data = pixmap_to_data(cast('QImage | QPixmap', data))
         elif callable(getattr(data, 'read', None)):
             data = data.read()  # ty: ignore[missing-union-attribute]
         if data is None:

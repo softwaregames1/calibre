@@ -4,12 +4,15 @@
 import os
 import re
 import sys
+from bisect import bisect_left
 from html import escape
+from itertools import accumulate
 from operator import attrgetter
 from typing import IO, TYPE_CHECKING, NamedTuple, cast
 
 from lxml import etree
 
+from calibre.ebooks.conversion.preprocess import repeated_hyphen_joins
 from calibre.ebooks.pdf.bidi import fix_markup_line, has_rtl, is_predominantly_rtl, markup_to_text
 
 if TYPE_CHECKING:
@@ -19,6 +22,8 @@ if TYPE_CHECKING:
     from lxml.etree import _Element
 
     from calibre.ebooks.oeb.polish.toc import TOC
+    from calibre.spell import DictionaryLocale
+    from calibre.spell.dictionary import LoadedDictionary
     from calibre.utils.logging import Log
 
     type PageElement = Text | Image
@@ -49,20 +54,53 @@ REPEATED_HEAD_MAX_DISTANCE = 2
 # character is never in the text, as clean_ascii_chars() removes them all from
 # the output of pdftohtml, and, unlike some others, is not whitespace.
 HYPHEN_JOIN = '\x01'
+# Marks the join of a line that ends with a hyphen followed by spaces, as in
+# the text of OCR programs. The spaces are removed for the decision, and put
+# back if the hyphen is kept, as it is then a dash between words.
+HYPHEN_SPACE_JOIN = '\x03'
+HYPHEN_JOINS = '[' + HYPHEN_JOIN + HYPHEN_SPACE_JOIN + ']'
 # A line that ends with a hyphen after a letter, and one that starts with a
-# lowercase letter, can be the two parts of a word
-SPLIT_WORD_START = re.compile(r'[^\W\d_][-\u2010]$')
+# lowercase letter, can be the two parts of a word. Matches the whole word
+# before the hyphen.
+SPLIT_WORD_START = re.compile(r'\w*[^\W\d_][-\u2010\u00ad]$')
+# The start of a line that repeats the hyphen of a word wrapped at its hyphen, as in Polish
+REPEATED_HYPHEN = re.compile(r'^((?:<[^>]*>)*)[-\u2010](?=[^\W\d_])')
+# A hyphen after a letter at the end of a line, followed by spaces, as OCR
+# programs output, see HYPHEN_SPACE_JOIN
+HYPHEN_THEN_SPACE_AT_END = re.compile(r'[^\W\d_][-\u2010\u00ad]\s+$')
+# The spaces after the last hyphen of the raw HTML of such a line, mixed with
+# any markup, as in <i>kriau-</i> followed by a space
+SPACE_AFTER_HYPHEN_IN_MARKUP = re.compile(r'(?<=[-\u2010\u00ad])(?:<[^>]*>|\s)*\s(?:<[^>]*>|\s)*$')
+MARKUP_TAG = re.compile(r'<[^>]*>')
+# A soft hyphen is only a place where a word may be broken, so one at the end
+# of a line is always removed
+SOFT_HYPHEN = '\u00ad'
 # The two parts of a word split at a hyphen, and any markup in between
-SPLIT_WORD = re.compile(r'(\w+)([-\u2010])((?:<[^>]*>)*)' + HYPHEN_JOIN + r'((?:<[^>]*>)*)(\w+)')
+SPLIT_WORD = re.compile(r'(\w+)([-\u2010\u00ad])((?:<[^>]*>)*)' + HYPHEN_JOINS + r'((?:<[^>]*>)*)(\w+)')
 WORD = re.compile(r'\w+(?:[-\u2010]\w+)*')
 # Every mark, with the parts of the word split there if they are words
-SPLIT_WORD_AT_JOIN = re.compile(r'(\w+)?([-\u2010])?((?:<[^>]*>)*)' + HYPHEN_JOIN + r'((?:<[^>]*>)*)(\w+)?')
-# The hyphen before a mark, and any markup in between
-HYPHEN_AT_JOIN = re.compile(r'([-\u2010]?)((?:<[^>]*>)*)' + HYPHEN_JOIN)
+SPLIT_WORD_AT_JOIN = re.compile(r'(\w+)?([-\u2010\u00ad])?((?:<[^>]*>)*)' + HYPHEN_JOINS + r'((?:<[^>]*>)*)(\w+)?')
+# The hyphen before a mark, any markup in between, and the mark
+HYPHEN_AT_JOIN = re.compile(r'([-\u2010\u00ad]?)((?:<[^>]*>)*)(' + HYPHEN_JOINS + ')')
 # A spelling dictionary is used for words that are not found elsewhere in the
 # document, if it recognises at least this fraction of the most common words of
 # the document, as that means the document is in its language
 DICTIONARY_MIN_RECOGNIZED = 0.8
+# A word split over two lines that is in neither the document nor the
+# dictionary, such as a name, is joined if another form of it, with an ending
+# of at most this many letters more, is in the document, and the hyphenation
+# rules of its language allow a break there. The other form shares the stem of
+# the word, which is the word without this many letters, keeping at least one
+# letter after the split, and of at least this many letters, so that short
+# words are not taken for forms of longer ones.
+OTHER_FORM_ENDING = 3
+OTHER_FORM_MAX_EXTRA = 4
+OTHER_FORM_MIN_STEM = 5
+# The hyphenation library ignores the minimum number of letters before and
+# after a break in hyphenation rules, so these are used instead, as most rules
+# allow no break after the first letter or before the last two
+HYPHENATION_MIN_BEFORE = 2
+HYPHENATION_MIN_AFTER = 3
 #### Large initial letters
 # A large initial letter, or drop cap, is at least this many times the size
 # of the text after it, which it is joined to without a space if it starts the
@@ -257,12 +295,15 @@ def adjacent_quotes(first_string: str, second_string: str) -> bool:
 
 
 def resolve_hyphen_joins(text: str, keep: Sequence[bool]) -> str:
-    # Remove each HYPHEN_JOIN mark in text, and the hyphen before it unless
-    # the next of keep is True. Hyphens are kept for marks beyond keep.
+    # Remove each HYPHEN_JOIN or HYPHEN_SPACE_JOIN mark in text, and the
+    # hyphen before it unless the next of keep is True. Hyphens are kept for
+    # marks beyond keep. A kept hyphen gets back the space that followed it.
     decisions = iter(keep)
 
     def sub(m: re.Match[str]) -> str:
-        return (m.group(1) if next(decisions, True) else '') + m.group(2)
+        if not next(decisions, True):
+            return m.group(2)
+        return m.group(1) + m.group(2) + (' ' if m.group(3) == HYPHEN_SPACE_JOIN else '')
 
     return HYPHEN_AT_JOIN.sub(sub, text)
 
@@ -630,11 +671,17 @@ class Text(Element):
         self.font_size_em = max(self.font_size_em, other.font_size_em)
         self.monospace = self.monospace and other.monospace
         self.font = other.font
+        # The text of OCR programs can have spaces after the hyphen at the end
+        # of a line, see HYPHEN_SPACE_JOIN
+        spaced_hyphen = (not same_line or wraps) and other.text_as_string[:1].islower() and HYPHEN_THEN_SPACE_AT_END.search(self.text_as_string) is not None
+        if spaced_hyphen:
+            self.text_as_string = self.text_as_string.rstrip()
+            self.raw = SPACE_AFTER_HYPHEN_IN_MARKUP.sub(lambda m: ''.join(MARKUP_TAG.findall(m.group())), self.raw)
         if has_gap > 0:
             if has_gap < 3:  # Small number of spaces = 1 space
                 if not (
                     self.text_as_string.endswith(' ')
-                    or self.text_as_string.endswith(('-', '\u2010'))
+                    or self.text_as_string.endswith(('-', '\u2010', SOFT_HYPHEN))
                     or other.text_as_string.startswith(' ')
                     or other.text_as_string.startswith('-')
                 ):
@@ -683,9 +730,26 @@ class Text(Element):
         # wrapped at its hyphen, is decided once all the text is known. Lines
         # next to a large initial letter are joined as parts of its line, but
         # each starts back at the left.
-        split_word = (not same_line or wraps) and SPLIT_WORD_START.search(self.text_as_string) is not None and other.text_as_string[:1].islower()
+        line_end = SPLIT_WORD_START.search(self.text_as_string) if not same_line or wraps else None
+        if (
+            line_end is not None
+            and (repeated := REPEATED_HYPHEN.match(other.text_as_string)) is not None
+            and repeated_hyphen_joins(line_end.group(), other.text_as_string[repeated.end() :])
+        ):
+            # A hyphenated word wrapped at its hyphen, with the hyphen repeated
+            # on the next line, keeps one hyphen. Otherwise, such as before
+            # dialogue, the dash stays.
+            raw, n = REPEATED_HYPHEN.subn(r'\1', other.raw, count=1)
+            if n:
+                other.raw = raw
+                other.text_as_string = repeated.group(1) + other.text_as_string[repeated.end() :]
+                line_end = None
+        split_word = line_end is not None and other.text_as_string[:1].islower()
+        hyphen_join = HYPHEN_SPACE_JOIN if spaced_hyphen else HYPHEN_JOIN
         if split_word:
-            self.text_as_string += HYPHEN_JOIN
+            self.text_as_string += hyphen_join
+        elif spaced_hyphen:
+            self.text_as_string += ' '
         elif initial:
             self.text_as_string += INITIAL_JOIN
         self.text_as_string += other.text_as_string
@@ -729,7 +793,9 @@ class Text(Element):
         if has_float:
             self.raw += has_float
         if split_word:
-            self.raw += HYPHEN_JOIN
+            self.raw += hyphen_join
+        elif spaced_hyphen:
+            self.raw += ' '
         elif initial:
             self.raw += INITIAL_JOIN
         self.raw += other.raw
@@ -2291,6 +2357,11 @@ class PDFDocument:
         # see spelling_dictionary()
         self.dictionary_searched = False
         self.recognized_by_dictionary: Callable[[str], bool] | None = None
+        # The locale of that dictionary, to find the hyphenation rules of the
+        # language, see hyphenation_dictionary()
+        self.dictionary_locale: DictionaryLocale | None = None
+        self.hyphenation_searched = False
+        self.hyphenation_rules: object | None = None
 
         # Check for a testable value
         if self.opts.pdf_header_regex is None:
@@ -2813,10 +2884,13 @@ class PDFDocument:
         dictionary, as it is in any language and has names and made up words,
         whichever of the word with and without the hyphen is found elsewhere
         in it is used. Words found in neither form are looked up in a spelling
-        dictionary for the language of the document. The hyphen is kept if
-        that does not decide either.
+        dictionary for the language of the document. A word that is not in the
+        dictionary either, such as a name, is joined if another form of it,
+        such as the same name with a different ending, is found elsewhere in
+        the document and the hyphenation rules of the language allow a line to
+        break it there. Otherwise the hyphen is kept.
         """
-        texts = [t for page in self.pages for t in page.texts if HYPHEN_JOIN in t.raw or HYPHEN_JOIN in t.text_as_string]
+        texts = [t for page in self.pages for t in page.texts if any(j in t.raw or j in t.text_as_string for j in (HYPHEN_JOIN, HYPHEN_SPACE_JOIN))]
         if not texts:
             return
         # The words of the document, other than the parts of words split
@@ -2824,10 +2898,37 @@ class PDFDocument:
         counts: dict[str, int] = {}
         for page in self.pages:
             for t in page.texts:
-                for word in WORD.findall(SPLIT_WORD.sub(' ', t.text_as_string)):
+                # Soft hyphens inside words are not where words end
+                for word in WORD.findall(SPLIT_WORD.sub(' ', t.text_as_string).replace(SOFT_HYPHEN, '')):
                     word = word.lower()
                     counts[word] = counts.get(word, 0) + 1
         decisions: dict[tuple[str, str], bool] = {}
+        sorted_words: list[str] = []
+
+        def other_form_in_document(word: str, split_at: int) -> bool:
+            # See OTHER_FORM_ENDING
+            stem = word[: max(split_at + 1, len(word) - OTHER_FORM_ENDING)]
+            if len(stem) >= len(word) or len(stem) < OTHER_FORM_MIN_STEM:
+                return False
+            if not sorted_words:
+                sorted_words.extend(sorted(counts))
+            for i in range(bisect_left(sorted_words, stem), len(sorted_words)):
+                w = sorted_words[i]
+                if not w.startswith(stem):
+                    break
+                # Not an unrelated longer word with the same start
+                if len(w) - len(stem) <= OTHER_FORM_MAX_EXTRA:
+                    return True
+            return False
+
+        def is_name(first: str, second: str, recognized: Callable[[str], bool]) -> bool:
+            # A word not in the dictionary, such as a name, see OTHER_FORM_ENDING.
+            # Both parts being in the dictionary means a compound word.
+            if not second[:1].islower() or (recognized(first) and recognized(second)):
+                return False
+            word = (first + second).lower()
+            # Lowercasing can change the length of a word, making split_at wrong
+            return len(word) == len(first) + len(second) and other_form_in_document(word, len(first)) and self.is_hyphenation_point(word, len(first))
 
         def remove_hyphen(first: str, second: str) -> bool:
             key = first, second
@@ -2839,7 +2940,7 @@ class PDFDocument:
                     ans = joined > hyphenated
                 else:
                     recognized = self.spelling_dictionary(counts)
-                    ans = recognized is not None and recognized(first + second)
+                    ans = recognized is not None and (recognized(first + second) or is_name(first, second, recognized))
                 decisions[key] = ans
             return ans
 
@@ -2848,7 +2949,9 @@ class PDFDocument:
             # the raw HTML can split the parts of the word anywhere. The hyphen
             # before each mark in the text and the HTML is kept or removed.
             keep = [
-                m.group(1) is None or m.group(5) is None or not remove_hyphen(m.group(1), m.group(5)) for m in SPLIT_WORD_AT_JOIN.finditer(t.text_as_string)
+                # See SOFT_HYPHEN
+                m.group(2) != SOFT_HYPHEN and (m.group(1) is None or m.group(5) is None or not remove_hyphen(m.group(1), m.group(5)))
+                for m in SPLIT_WORD_AT_JOIN.finditer(t.text_as_string)
             ]
             t.text_as_string = resolve_hyphen_joins(t.text_as_string, keep)
             if len(HYPHEN_AT_JOIN.findall(t.raw)) == len(keep):
@@ -2910,32 +3013,48 @@ class PDFDocument:
         # say what language they are in. Found the first time it is needed.
         if not self.dictionary_searched:
             self.dictionary_searched = True
-            self.recognized_by_dictionary = self.find_spelling_dictionary(counts)
+            if (d := self.find_spelling_dictionary(counts)) is not None:
+                self.recognized_by_dictionary, self.dictionary_locale = d.obj.recognized, d.primary_locale
         return self.recognized_by_dictionary
 
-    def find_spelling_dictionary(self, counts: dict[str, int]) -> Callable[[str], bool] | None:
-        sample = [w for w in sorted(counts, key=counts.__getitem__, reverse=True) if w.isalpha()][:DICTIONARY_SAMPLE_WORDS]
-        if not sample:
-            return None
-        try:
-            from calibre.spell.dictionary import builtin_dictionaries, custom_dictionaries, load_dictionary
+    def find_spelling_dictionary(self, counts: dict[str, int]) -> LoadedDictionary | None:
+        from calibre.spell.dictionary import dictionary_recognizing_words
 
-            candidates = list(custom_dictionaries()) + list(builtin_dictionaries())
-        except Exception as e:
-            self.log.warning(f'Could not find spelling dictionaries to remove hyphens with: {e}')
-            return None
-        best: Callable[[str], bool] | None = None
-        best_count = DICTIONARY_MIN_RECOGNIZED * len(sample)
-        for d in candidates:
+        sample = [w for w in sorted(counts, key=counts.__getitem__, reverse=True) if w.isalpha()][:DICTIONARY_SAMPLE_WORDS]
+        return dictionary_recognizing_words(sample, DICTIONARY_MIN_RECOGNIZED, self.log)
+
+    def hyphenation_dictionary(self) -> object | None:
+        # The hyphenation rules for the language of the spelling dictionary,
+        # loaded the first time they are needed
+        if not self.hyphenation_searched and self.dictionary_locale is not None:
+            self.hyphenation_searched = True
+            lc, cc = self.dictionary_locale
+            locale = f'{lc}_{cc}' if cc else lc
             try:
-                recognized = load_dictionary(d).obj.recognized
-                count = sum(1 for w in sample if recognized(w))
+                from calibre.utils.hyphenation.hyphenate import dictionary_for_locale
+
+                self.hyphenation_rules = dictionary_for_locale(locale)
             except Exception as e:
-                self.log.warning(f'Could not use the spelling dictionary {d.dicpath}: {e}')
-                continue
-            if count >= best_count:
-                best, best_count = recognized, count
-        return best
+                self.log.warning(f'Could not load the hyphenation rules for {locale}: {e}')
+            else:
+                if self.hyphenation_rules is None:
+                    self.log.debug(f'No hyphenation rules for {locale}, split words not in the dictionary keep their hyphen')
+        return self.hyphenation_rules
+
+    def is_hyphenation_point(self, word: str, split_at: int) -> bool:
+        # Whether the hyphenation rules allow a break in the lowercase word
+        # after its first split_at letters, see HYPHENATION_MIN_BEFORE
+        if split_at < HYPHENATION_MIN_BEFORE or len(word) - split_at < HYPHENATION_MIN_AFTER:
+            return False
+        if (rules := self.hyphenation_dictionary()) is None:
+            return False
+        from calibre_extensions import hyphen
+
+        try:
+            parts = hyphen.simple_hyphenate(rules, word).split('=')
+        except ValueError:
+            return False  # A word needing non-standard hyphenation, with replacements
+        return split_at in accumulate(map(len, parts[:-1]))
 
     def remove_repeated_heads(self, header: bool, footer: bool) -> None:
         """

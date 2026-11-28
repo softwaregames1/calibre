@@ -85,7 +85,8 @@ class BuildTest(unittest.TestCase):
         self.assertIn('en', codes, 'langtool was built without static rule tables')
         for code in codes:
             tables = tables_for(code)
-            if tables is not None:
+            # Only frozen builds are guaranteed to use the same version of regex as the tables were built with
+            if tables is not None and isfrozen:
                 self.assertTrue(tables.regex_programs_usable(), f'The langtool rule tables for {code} were built with a different version of regex')
         bad = {k: v for k, v in langtool.static_rules_status().items() if v != 'ok'}
         self.assertFalse(bad, f'Some langtool static rule tables are not usable: {bad}')
@@ -116,7 +117,7 @@ class BuildTest(unittest.TestCase):
         enc = detect(raw).lower()
         self.assertEqual(enc, 'utf-8')
         # The following is used by html5lib
-        from chardet.universaldetector import UniversalDetector
+        from chardet import UniversalDetector
 
         detector = UniversalDetector()
         self.assertTrue(hasattr(detector, 'done'))
@@ -494,10 +495,15 @@ class BuildTest(unittest.TestCase):
         else:
             wpd.uninit()
 
-    def test_tinycss_tokenizer(self) -> None:
-        from tinycss.tokenizer import c_tokenize_flat
+    def test_kgcss(self) -> None:
+        import kgcss
+        from kgcss import _kgcss  # the C extension
+        from lxml import etree
 
-        self.assertIsNotNone(c_tokenize_flat, 'tinycss C tokenizer not loaded')
+        self.assertTrue(_kgcss)
+        sheet = kgcss.parse_stylesheet('p.x { color: red }')
+        root = etree.fromstring('<html><body><p class="x"/></body></html>')
+        self.assertEqual(len(tuple(kgcss.Select(root)(sheet.rules[0].selectors))), 1)
 
     @unittest.skipUnless(getattr(sys, 'frozen', False), 'Only makes sense to test executables in frozen builds')
     def test_executables(self) -> None:
@@ -610,9 +616,6 @@ def find_tests(only_build: bool = False) -> unittest.TestSuite:
     if only_build:
         return ans
     from calibre.utils.icu_test import find_tests
-
-    ans.addTests(find_tests())
-    from tinycss.tests.main import find_tests
 
     ans.addTests(find_tests())
     from calibre.spell.dictionary import find_tests

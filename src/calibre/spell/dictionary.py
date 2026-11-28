@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Iterator, Sequence
     from typing import NotRequired, TypedDict, Unpack
 
+    from calibre.utils.logging import Log
     from calibre_extensions import hunspell
 
     class UserDictionaryData(TypedDict):
@@ -131,12 +132,10 @@ def custom_dictionaries(reread: bool = False) -> frozenset[Dictionary]:
                 continue
             base = os.path.dirname(lc)
             ploc = parse_lang_code(locale)
-            if ploc.countrycode is None:
-                continue
             dics.append(
                 Dictionary(
                     ploc,
-                    frozenset(filter(lambda x: x.countrycode is not None, map(parse_lang_code, locales))),
+                    frozenset(x for x in map(parse_lang_code, locales) if x.countrycode is not None or x == ploc),
                     os.path.join(base, f'{locale}.dic'),
                     os.path.join(base, f'{locale}.aff'),
                     False,
@@ -202,6 +201,14 @@ def get_dictionary(locale: DictionaryLocale, exact_match: bool = False) -> Dicti
     # otherwise, if a builtin dictionary exists, use that
     if preferred in exact_matches:
         return exact_matches[preferred]
+    if locale.countrycode is None and not exact_match:
+        # Without an explicit preference, a plain language uses the preferred
+        # country variant rather than a dictionary that has no country
+        best_locale = best_locale_for_language(locale.langcode)
+        if best_locale is not None and best_locale.countrycode is not None:
+            ans = get_dictionary(best_locale, exact_match=True)
+            if ans is not None:
+                return ans
     # Return one of the exactly matching dictionaries, preferring user
     # installed to builtin ones
     for k in sorted(exact_matches, key=lambda x: (1, None) if x is None else (0, x)):
@@ -240,6 +247,41 @@ def load_dictionary(dictionary: Dictionary) -> LoadedDictionary:
 
     obj = hunspell.Dictionary(fix_path(dictionary.dicpath), fix_path(dictionary.affpath))
     return LoadedDictionary(dictionary.primary_locale, dictionary.locales, obj, dictionary.builtin, dictionary.name, dictionary.id)
+
+
+def dictionary_recognizing_words(words: Sequence[str], min_recognized: float, log: Log) -> LoadedDictionary | None:
+    """
+    Return the spelling dictionary that
+    recognizes the most of the specified words, if it recognizes at least the
+    min_recognized fraction of them, for documents whose language is not
+    known. User installed dictionaries are preferred to builtin ones, and ties
+    are broken by locale and path, so that the choice is the same every time.
+    """
+    if not words:
+        return None
+    try:
+        candidates = [
+            d
+            for collection in (custom_dictionaries(), builtin_dictionaries())
+            for d in sorted(collection, key=lambda d: (d.primary_locale.langcode, d.primary_locale.countrycode or '', d.dicpath))
+        ]
+    except Exception as e:
+        log.warning(f'Could not find spelling dictionaries: {e}')
+        return None
+    best: LoadedDictionary | None = None
+    best_count = min_recognized * len(words)
+    for d in candidates:
+        try:
+            loaded = load_dictionary(d)
+            recognized = loaded.obj.recognized
+            count = sum(1 for w in words if recognized(w))
+        except Exception as e:
+            log.warning(f'Could not use the spelling dictionary {d.dicpath}: {e}')
+            continue
+        # Only a strictly better dictionary replaces an earlier one, for a stable choice
+        if (best is None and count >= best_count) or count > best_count:
+            best, best_count = loaded, count
+    return best
 
 
 class Dictionaries:
@@ -522,6 +564,66 @@ def find_tests() -> unittest.TestSuite:
             self.assertIn('adequately', self.suggestions('ade-quately'))
             self.assertIn('magic. Wand', self.suggestions('magic.wand'))
             self.assertIn('List', self.suggestions('Lis𝑘t'))
+
+        def test_import_locales(self) -> None:
+            import tempfile
+
+            from calibre.spell.import_from import _import_from_virtual_directory
+
+            def do_import(dictionaries: dict[str, str]) -> list[list[str]]:
+                nodes = ''.join(
+                    f'''<node oor:name="{name}" oor:op="fuse">
+                    <prop oor:name="Locations" oor:type="oor:string-list"><value>%origin%/{name}.aff %origin%/{name}.dic</value></prop>
+                    <prop oor:name="Format" oor:type="xs:string"><value>DICT_SPELL</value></prop>
+                    <prop oor:name="Locales" oor:type="oor:string-list"><value>{locales}</value></prop></node>'''
+                    for name, locales in dictionaries.items()
+                )
+                files = {
+                    'META-INF/manifest.xml': b'''<manifest:manifest xmlns:manifest="http://openoffice.org/2001/manifest">
+                    <manifest:file-entry manifest:media-type="application/vnd.sun.star.configuration-data" manifest:full-path="dictionaries.xcu"/>
+                    </manifest:manifest>''',
+                    'dictionaries.xcu': f'''<oor:component-data xmlns:oor="http://openoffice.org/2001/registry"
+                    xmlns:xs="http://www.w3.org/2001/XMLSchema" oor:name="Linguistic" oor:package="org.openoffice.Office">
+                    <node oor:name="ServiceManager"><node oor:name="Dictionaries">{nodes}</node></node></oor:component-data>'''.encode(),
+                }
+                for name in dictionaries:
+                    files[f'{name}.aff'] = b'SET UTF-8\n'
+                    files[f'{name}.dic'] = b'1\nword\n'
+                with tempfile.TemporaryDirectory() as tdir:
+                    num = _import_from_virtual_directory(files.__getitem__, 'test', dest_dir=tdir)
+                    ans = []
+                    for x in sorted(os.listdir(tdir)):
+                        with open(os.path.join(tdir, x, 'locales'), 'rb') as f:
+                            ans.append(f.read().decode('utf-8').splitlines()[1:])
+                    self.assertEqual(num, len(ans))
+                    return ans
+
+            # Locales without a country are dropped when the dictionary has locales with a country
+            self.assertEqual(do_import({'de': 'de de_DE de_AT'}), [['de_DE', 'de_AT']])
+            # Languages not tied to a country, such as Esperanto, are kept
+            self.assertEqual(do_import({'eo': 'eo'}), [['eo']])
+            self.assertEqual(do_import({'lt': 'lt'}), [['lt_LT']])
+            # Skipped dictionaries must not leave an empty folder behind
+            self.assertEqual(do_import({'none': ''}), [])
+
+        def test_plain_language_preference(self) -> None:
+            from unittest.mock import patch
+
+            def dic(locale: str, did: str) -> Dictionary:
+                loc = parse_lang_code(locale)
+                return Dictionary(loc, frozenset((loc,)), f'{did}.dic', f'{did}.aff', False, did, did)
+
+            plain, variant = dic('eo', 'plain'), dic('eo-FR', 'variant')
+            prefs: dict[str, dict[str, str]] = {'preferred_dictionaries': {}, 'preferred_locales': {'epo': 'eo-FR'}}
+            with patch(f'{__name__}._custom', frozenset((plain, variant))), patch(f'{__name__}.dprefs', prefs):
+                # Without an explicit preference the preferred country variant is used
+                self.assertEqual(get_dictionary(parse_lang_code('eo')), variant)
+                # An explicit preference for the plain language wins
+                prefs['preferred_dictionaries']['eo'] = 'plain'
+                self.assertEqual(get_dictionary(parse_lang_code('eo')), plain)
+                # exact_match never falls back to a country variant
+                prefs['preferred_dictionaries'].clear()
+                self.assertEqual(get_dictionary(parse_lang_code('eo'), exact_match=True), plain)
 
     return unittest.TestLoader().loadTestsFromTestCase(TestDictionaries)
 

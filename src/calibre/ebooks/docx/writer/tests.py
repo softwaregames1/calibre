@@ -355,6 +355,20 @@ class TestWhitespace(BaseTest):
 
 
 class TestStyles(BaseTest):
+    def test_css_font_family_to_docx(self) -> None:
+        from calibre.ebooks.docx.writer.styles import css_font_family_to_docx as c
+
+        self.assertEqual(c('"Helvetica Neue", Arial, sans-serif'), 'Helvetica Neue')
+        # Unquoted names with spaces are one family
+        self.assertEqual(c('Times New Roman, serif'), 'Times New Roman')
+        self.assertEqual(c(r'Hawaii\ 5-0'), 'Hawaii 5-0')
+        # Generic families are mapped to fonts Word has
+        self.assertEqual(c('serif'), 'Cambria')
+        self.assertEqual(c('SANS-SERIF, Arial'), 'Candara')
+        self.assertEqual(c('cursive'), 'Segoe Script')
+        self.assertIsNone(c('inherit'))
+        self.assertIsNone(c(''))
+
     def test_html_docx_html_roundtrip(self) -> None:
         from calibre.ebooks.conversion.plumber import Plumber
 
@@ -417,6 +431,199 @@ class TestStyles(BaseTest):
         self.assertEqual(numbering.instances['1'].levels[2].fmt, 'upper-roman')
 
 
+NOTES_SOURCE = '''<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Notes</title></head><body>
+<h1>Chapter One</h1>
+<p>Aside<a epub:type="noteref" href="#fn1" id="fr1">[1]</a> endnote<a role="doc-noteref" href="#en1"
+id="er1"><sup>2</sup></a> heuristic<sup><a href="#hn1" id="hr1">3</a></sup>.</p>
+<p>Repeat<a role="doc-noteref" href="#en1"><sup>2</sup></a> and see <a href="#plain">4</a>.</p>
+<aside epub:type="footnote" id="fn1"><p><a href="#fr1">1.</a> Aside note with <i>italics</i> and a <a
+href="https://calibre-ebook.com">link</a>.</p><p>Second aside para.</p></aside>
+<p id="hn1"><a href="#hr1">3</a> Heuristic note.</p>
+<p id="plain">Plain paragraph, not a note.</p>
+<h1>Chapter Two</h1>
+<p>Body of chapter two.</p>
+<section epub:type="endnotes"><h2>Endnotes</h2>
+<ol><li id="en1"><p>Endnote text. <a href="#er1" role="doc-backlink">\u21a9</a></p></li></ol>
+</section>
+</body></html>'''
+
+FALSE_POSITIVES_SOURCE = '''<html><head><title>Not notes</title></head><body>
+<h1>Contents</h1>
+<p id="t1"><a href="#c1">1</a></p>
+<h2 id="c1"><a href="#t1">1</a></h2>
+<p>Chapter text that must stay.</p>
+<p>Two notes in one paragraph<sup><a href="#m1" id="mr1">1</a></sup><sup><a href="#m2" id="mr2">2</a></sup>
+and a not superscript cross reference <a href="#x1" id="xr1">3</a>.</p>
+<p><a id="m1" href="#mr1">1</a> First note in shared paragraph.<br/><a id="m2" href="#mr2">2</a> Second note in shared paragraph.</p>
+<p id="x1"><a href="#xr1">back</a> Cross referenced paragraph.</p>
+<p>Superscript link without a link back<sup><a href="#y1">4</a></sup>.</p>
+<p id="y1">Paragraph without a link back.</p>
+</body></html>'''
+
+
+class TestNotes(BaseTest):
+    def convert(self, source: str, notes: str = 'footnotes', suffix: str = 'xhtml') -> tuple[Path, TemporaryDirectory]:
+        from calibre.ebooks.conversion.plumber import Plumber
+
+        tdir = TemporaryDirectory()
+        base = Path(tdir.name)
+        src, docx = base / f'input.{suffix}', base / 'output.docx'
+        src.write_text(source, encoding='utf-8')
+        plumber = Plumber(str(src), str(docx), DevNull())
+        plumber.merge_ui_recommendations([('docx_no_toc', True, 3), ('docx_no_cover', True, 3), ('docx_notes', notes, 3)])
+        plumber.run()
+        return docx, tdir
+
+    def parts(self, docx: Path) -> dict[str, etree._Element]:
+        with ZipFile(docx) as zf:
+            return {name: etree.fromstring(zf.read(name)) for name in zf.namelist() if name.endswith(('.xml', '.rels'))}
+
+    def paragraphs(self, root: etree._Element) -> list[str]:
+        return [''.join(self.xpath('.//w:t/text()', p)) for p in self.xpath('.//w:p', root)]
+
+    def notes(self, root: etree._Element, tag: str = 'footnote') -> dict[str, list[str]]:
+        return {n.get(self.namespace.expand('w:id')): self.paragraphs(n) for n in self.xpath(f'./w:{tag}[not(@w:type)]', root)}
+
+    def test_notes(self) -> None:
+        docx, tdir = self.convert(NOTES_SOURCE)
+        with tdir:
+            parts = self.parts(docx)
+            document, footnotes = parts['word/document.xml'], parts['word/footnotes.xml']
+            body = self.paragraphs(document)
+            self.assertEqual(
+                self.notes(footnotes),
+                {
+                    '1': [' Aside note with italics and a link.', 'Second aside para.'],
+                    '2': [' Endnote text. '],
+                    '3': [' Heuristic note.'],
+                },
+            )
+            self.assertEqual(self.xpath('//w:footnoteReference/@w:id', document), ['1', '2', '3'])
+            self.assertIn('Aside endnote heuristic.', body)
+            self.assertIn('Repeat2 and see 4.', body)
+            self.assertIn('Plain paragraph, not a note.', body)
+            self.assertNotIn('Endnotes', body)
+            self.assertFalse([p for p in body if 'Heuristic note' in p or 'Aside note' in p or 'Endnote text' in p])
+            # The second reference to a note is a NOTEREF field pointing to the first reference
+            fields = self.xpath('//w:fldSimple/@w:instr', document)
+            self.assertEqual(len(fields), 1)
+            bmark = fields[0].split()[1]
+            self.assertIn(bmark, self.xpath('//w:bookmarkStart[following-sibling::w:r[1]/w:footnoteReference[@w:id="2"]]/@w:name', document))
+            # Links inside notes need the relationships for the notes part
+            rels = parts['word/_rels/footnotes.xml.rels']
+            rid = self.xpath('//w:footnote//w:hyperlink/@r:id', footnotes)[0]
+            self.assertEqual(rels.xpath('//*[@Id=$rid]/@Target', rid=rid), ['https://calibre-ebook.com'])
+            self.assertTrue(self.xpath('//w:style[@w:styleId="FootnoteReference"]', parts['word/styles.xml']))
+            ctypes = parts['[Content_Types].xml']
+            self.assertTrue(ctypes.xpath('//*[@PartName="/word/footnotes.xml"]'))
+
+    def test_endnotes_and_links(self) -> None:
+        docx, tdir = self.convert(NOTES_SOURCE, notes='endnotes')
+        with tdir:
+            parts = self.parts(docx)
+            self.assertNotIn('word/footnotes.xml', parts)
+            self.assertEqual(len(self.notes(parts['word/endnotes.xml'], 'endnote')), 3)
+            self.assertEqual(self.xpath('//w:endnoteReference/@w:id', parts['word/document.xml']), ['1', '2', '3'])
+            self.assertEqual(self.xpath('//w:sectPr/w:endnotePr/w:numFmt/@w:val', parts['word/document.xml']), ['decimal'])
+        docx, tdir = self.convert(NOTES_SOURCE, notes='links')
+        with tdir:
+            parts = self.parts(docx)
+            self.assertNotIn('word/footnotes.xml', parts)
+            self.assertNotIn('word/endnotes.xml', parts)
+            self.assertIn('Endnotes', self.paragraphs(parts['word/document.xml']))
+
+    def test_false_positives(self) -> None:
+        docx, tdir = self.convert(FALSE_POSITIVES_SOURCE, suffix='html')
+        with tdir:
+            parts = self.parts(docx)
+            self.assertNotIn('word/footnotes.xml', parts)
+            body = self.paragraphs(parts['word/document.xml'])
+            for text in ('Chapter text that must stay.', 'Cross referenced paragraph.', 'Paragraph without a link back.'):
+                self.assertTrue([p for p in body if text in p], text)
+            self.assertTrue([p for p in body if 'First note in shared paragraph' in p and 'Second note' in p])
+
+    def test_docx_html_docx_roundtrip(self) -> None:
+        from calibre.ebooks.conversion.plumber import Plumber
+
+        docx, tdir = self.convert(NOTES_SOURCE)
+        with tdir:
+            base = Path(tdir.name)
+            htmlz, docx2 = base / 'roundtrip.htmlz', base / 'roundtrip.docx'
+            Plumber(str(docx), str(htmlz), DevNull()).run()
+            with ZipFile(htmlz) as zf:
+                html = zf.read('index.html')
+            self.assertEqual(html.count(b'role="doc-noteref"'), 3)
+            plumber = Plumber(str(htmlz), str(docx2), DevNull())
+            plumber.merge_ui_recommendations([('docx_no_toc', True, 3), ('docx_no_cover', True, 3)])
+            plumber.run()
+            parts = self.parts(docx2)
+            document = parts['word/document.xml']
+            self.assertEqual(self.xpath('//w:footnoteReference/@w:id', document), ['1', '2', '3'])
+            notes = self.notes(parts['word/footnotes.xml'])
+            self.assertEqual(
+                [[x.strip() for x in v] for v in notes.values()],
+                [
+                    ['Aside note with italics and a link.', 'Second aside para.'],
+                    ['Endnote text.'],
+                    ['Heuristic note.'],
+                ],
+            )
+            body = self.paragraphs(document)
+            # The Notes section created by DOCX Input must not be present
+            self.assertNotIn('Notes', body)
+            self.assertFalse([p for p in body if '\u2190' in p])
+
+
+class TestDocProps(unittest.TestCase):
+    def setUp(self) -> None:
+        self.namespace = DOCXNamespace()
+
+    def read_tags(self, root: etree._Element) -> list[str]:
+        from calibre.ebooks.docx.container import read_doc_props
+        from calibre.ebooks.metadata.book.base import Metadata
+
+        mi = Metadata('Title')
+        read_doc_props(etree.tostring(root), mi, self.namespace.XPath)
+        return mi.tags
+
+    def core_properties(self, keywords: str | None = None) -> etree._Element:
+        cp = self.namespace.namespaces['cp']
+        root = etree.Element(f'{{{cp}}}coreProperties', nsmap={'cp': cp})
+        if keywords is not None:
+            etree.SubElement(root, f'{{{cp}}}keywords').text = keywords
+        return root
+
+    def test_keywords_round_trip(self) -> None:
+        from calibre.ebooks.docx.writer.container import update_doc_props
+        from calibre.ebooks.metadata.book.base import Metadata
+
+        for tags, expected in (
+            (['Science fiction', 'Space opera', 'One'], ['Science fiction', 'Space opera', 'One']),
+            (['Science fiction'], ['Science fiction']),
+            # Separators inside a tag must not split it
+            (['Romance; Historical', '小说；科幻'], ['Romance_ Historical', '小说_科幻']),
+        ):
+            with self.subTest(tags=tags):
+                mi = Metadata('Title', ['Author'])
+                mi.tags = tags
+                root = self.core_properties()
+                update_doc_props(root, mi, self.namespace)
+                self.assertEqual(self.read_tags(root), expected)
+
+    def test_keywords_separators(self) -> None:
+        for keywords, expected in (
+            ('Science fiction, Space opera', ['Science fiction', 'Space opera']),
+            # Word and Windows Explorer separate tags with semicolons
+            ('Science fiction; Space opera;', ['Science fiction', 'Space opera']),
+            (' One ,, Two words ; Three ', ['One', 'Two words', 'Three']),
+            # Full width separators used in CJK locales
+            ('小说；科幻，奇幻', ['小说', '科幻', '奇幻']),
+        ):
+            with self.subTest(keywords=keywords):
+                self.assertEqual(self.read_tags(self.core_properties(keywords)), expected)
+
+
 def find_tests() -> unittest.TestSuite:
     loader = unittest.defaultTestLoader
-    return unittest.TestSuite(loader.loadTestsFromTestCase(cls) for cls in (TestHyperlinks, TestWhitespace, TestStyles))
+    return unittest.TestSuite(loader.loadTestsFromTestCase(cls) for cls in (TestHyperlinks, TestWhitespace, TestStyles, TestNotes, TestDocProps))

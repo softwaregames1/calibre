@@ -1,25 +1,15 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2013, Kovid Goyal <kovid at kovidgoyal.net>
 
-import numbers
-from functools import wraps
-from typing import TYPE_CHECKING, Literal, cast, overload
+from typing import TYPE_CHECKING
 
-from css_parser import CSSParser
-from css_parser import profile as cssprofiles
-from css_parser.css import PropertyValue
-from tinycss.fonts3 import parse_font, serialize_font_family
-
-from calibre.ebooks.oeb.base import css_text
+from kgcss import RuleType, StyleRule, condense_shorthands, expand_shorthand, longhands
 
 if TYPE_CHECKING:
     import unittest
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Iterable, Sequence
 
-    from css_parser.css import CSSStyleDeclaration, CSSStyleSheet, Property
-
-    type Normalizer = Callable[[str, PropertyValue], dict[str, str]]
-    type Condenser = Callable[[CSSStyleDeclaration, Sequence[Property]], None]
+    from kgcss import Stylesheet
 
 DEFAULTS = {
     'azimuth': 'center',
@@ -128,258 +118,57 @@ DEFAULTS = {
 
 EDGES = ('top', 'right', 'bottom', 'left')
 BORDER_PROPS = ('color', 'style', 'width')
+# The initial values that expanding a shorthand gives the longhands it does not set
+SHORTHAND_INITIAL_VALUES = {k: str(v) for k, v in DEFAULTS.items()}
 
 
-def normalize_edge(name: str, cssvalue: PropertyValue) -> dict[str, str]:
-    style: dict[str, str] = {}
-    if isinstance(cssvalue, PropertyValue):
-        primitives = [css_text(v) for v in cssvalue]
-    else:
-        primitives = [css_text(cssvalue)]
-    if len(primitives) == 1:
-        (value,) = primitives
-        values = (value, value, value, value)
-    elif len(primitives) == 2:
-        vert, horiz = primitives
-        values = (vert, horiz, vert, horiz)
-    elif len(primitives) == 3:
-        top, horiz, bottom = primitives
-        values = (top, horiz, bottom, horiz)
-    else:
-        values = primitives[:4]
-    if '-' in name:
-        l, _, r = name.partition('-')
-        for edge, value in zip(EDGES, values):
-            style[f'{l}-{edge}-{r}'] = value
-    else:
-        for edge, value in zip(EDGES, values):
-            style[f'{name}-{edge}'] = value
-    return style
-
-
-def simple_normalizer(prefix: str, names: Iterable[str], check_inherit: bool = True) -> Normalizer:
-    composition = tuple(f'{prefix}-{n}' for n in names)
-
-    @wraps(normalize_simple_composition)
-    def wrapper(name: str, cssvalue: PropertyValue) -> dict[str, str]:
-        return normalize_simple_composition(name, cssvalue, composition, check_inherit=check_inherit)
-
-    return wrapper
-
-
-def normalize_simple_composition(name: str, cssvalue: PropertyValue, composition: Iterable[str], check_inherit: bool = True) -> dict[str, str]:
-    if check_inherit and css_text(cssvalue) == 'inherit':
-        style = {k: 'inherit' for k in composition}
-    else:
-        # the defaults of all shorthand components are strings
-        style = cast('dict[str, str]', {k: DEFAULTS[k] for k in composition})
-        try:
-            primitives = [css_text(v) for v in cssvalue]
-        except TypeError:
-            primitives = [css_text(cssvalue)]
-        while primitives:
-            value = primitives.pop()
-            for key in composition:
-                if cssprofiles.validate(key, value):
-                    style[key] = value
-                    break
-    return style
-
-
-font_composition = ('font-style', 'font-variant', 'font-weight', 'font-size', 'line-height', 'font-family')
-
-
-@overload
-def normalize_font(cssvalue: PropertyValue, font_family_as_list: Literal[False] = False) -> dict[str, str]: ...
-@overload
-def normalize_font(cssvalue: PropertyValue, font_family_as_list: bool) -> dict[str, str | list[str]]: ...
-def normalize_font(cssvalue: PropertyValue, font_family_as_list: bool = False) -> dict[str, str] | dict[str, str | list[str]]:
-    # See https://developer.mozilla.org/en-US/docs/Web/CSS/font
-    composition = font_composition
-    val = css_text(cssvalue)
-    ans: dict[str, str | list[str]]
-    font_defaults = cast('dict[str, str]', DEFAULTS)  # the defaults of all font properties are strings
-    if val == 'inherit':
-        ans = {k: 'inherit' for k in composition}
-    elif val in {'caption', 'icon', 'menu', 'message-box', 'small-caption', 'status-bar'}:
-        ans = {k: font_defaults[k] for k in composition}
-    else:
-        ans = {k: font_defaults[k] for k in composition}
-        ans.update(parse_font(val))
-    if font_family_as_list:
-        if isinstance(ans['font-family'], (str, bytes)):
-            ans['font-family'] = [x.strip() for x in ans['font-family'].split(',')]
-    elif not isinstance(ans['font-family'], (str, bytes)):
-        ans['font-family'] = serialize_font_family(ans['font-family'])
-    return ans
-
-
-def normalize_border(name: str, cssvalue: PropertyValue) -> dict[str, str]:
-    style = normalizers['border-' + EDGES[0]]('border-' + EDGES[0], cssvalue)
-    vals = style.copy()
-    for edge in EDGES[1:]:
-        style.update({k.replace(EDGES[0], edge): v for k, v in vals.items()})
-    return style
-
-
-normalizers: dict[str, Normalizer] = {
-    'list-style': simple_normalizer('list-style', ('type', 'position', 'image')),
-    'font': lambda prop, v: normalize_font(v),
-    'border': normalize_border,
-}
-
-for x in ('margin', 'padding', 'border-style', 'border-width', 'border-color'):
-    normalizers[x] = normalize_edge
-
-for x in EDGES:
-    name = 'border-' + x
-    normalizers[name] = simple_normalizer(name, BORDER_PROPS, check_inherit=False)
-
-SHORTHAND_DEFAULTS = {
-    'margin': '0',
-    'padding': '0',
-    'border-style': 'none',
-    'border-width': '0',
-    'border-color': 'currentColor',
-    'border': 'none',
-    'border-left': 'none',
-    'border-right': 'none',
-    'border-top': 'none',
-    'border-bottom': 'none',
-    'list-style': 'inherit',
-    'font': 'inherit',
-}
-
-_safe_parser: CSSParser | None = None
-
-
-def safe_parser() -> CSSParser:
-    global _safe_parser
-    if _safe_parser is None:
-        import logging
-
-        _safe_parser = CSSParser(loglevel=logging.CRITICAL, validate=False)
-    return _safe_parser
+def normalize_shorthand(name: str, value: str) -> dict[str, str] | None:
+    """
+    The longhands of the shorthand property name with the specified value:
+    those the value sets and the initial values of the rest. None if name is
+    not one of the shorthands that calibre expands (margin, padding, border,
+    the border edges and parts, list-style and font) or the value is not valid
+    for it, in which case the declaration should be left as it is.
+    """
+    # quirks_mode accepts lengths without units, as browsers do in quirks mode
+    return expand_shorthand(name, value, initial=SHORTHAND_INITIAL_VALUES, quirks_mode=True)
 
 
 def normalize_filter_css(props: Iterable[str]) -> set[str]:
-    ans: set[str] = set()
-    p = safe_parser()
-    for prop in props:
-        n = normalizers.get(prop, None)
-        ans.add(prop)
-        if n is not None and prop in SHORTHAND_DEFAULTS:
-            dec = p.parseStyle(f'{prop}: {SHORTHAND_DEFAULTS[prop]}')
-            cssvalue = dec.getPropertyCSSValue(dec.item(0))
-            ans |= set(n(prop, cssvalue))
+    """The properties and the longhands of those that are shorthands"""
+    ans = set(props)
+    for prop in tuple(ans):
+        ans.update(longhands(prop))
     return ans
 
 
-def condense_edge(vals: Sequence[Property]) -> str | None:
-    edges: dict[str, str] = {x.name.rpartition('-')[-1]: x.value for x in vals}
-    if len(edges) != 4 or set(edges) != {'left', 'top', 'right', 'bottom'}:
-        return None
-    ce: dict[str, str] = {}
-    for x, y in [('left', 'right'), ('top', 'bottom')]:
-        if edges[x] == edges[y]:
-            ce[x] = edges[x]
-        else:
-            ce[x], ce[y] = edges[x], edges[y]
-    if len(ce) == 4:
-        return ' '.join(ce[x] for x in ('top', 'right', 'bottom', 'left'))
-    if len(ce) == 3:
-        if 'right' in ce:
-            return ' '.join(ce[x] for x in ('top', 'right', 'top', 'left'))
-        return ' '.join(ce[x] for x in ('top', 'left', 'bottom'))
-    if len(ce) == 2:
-        if ce['top'] == ce['left']:
-            return ce['top']
-        return ' '.join(ce[x] for x in ('top', 'left'))
-    return None
-
-
-def simple_condenser(prefix: str, func: Callable[[Sequence[Property]], str | None]) -> Condenser:
-    @wraps(func)
-    def condense_simple(style: CSSStyleDeclaration, props: Sequence[Property]) -> None:
-        cp = func(props)
-        if cp is not None:
-            for prop in props:
-                style.removeProperty(prop.name)
-            style.setProperty(prefix, cp)
-
-    return condense_simple
-
-
-def condense_border(style: CSSStyleDeclaration, props: Sequence[Property]) -> None:
-    prop_map = {p.name: p for p in props}
-    edge_vals: list[Property] = []
-    for edge in EDGES:
-        name = f'border-{edge}'
-        vals: list[Property] = []
-        for prop in BORDER_PROPS:
-            x = prop_map.get(f'{name}-{prop}', None)
-            if x is not None:
-                vals.append(x)
-        if len(vals) == 3:
-            for prop in vals:
-                style.removeProperty(prop.name)
-            style.setProperty(name, ' '.join(x.value for x in vals))
-            prop_map[name] = style.getProperty(name)
-        x = prop_map.get(name, None)
-        if x is not None:
-            edge_vals.append(x)
-    if len(edge_vals) == 4 and len({x.value for x in edge_vals}) == 1:
-        for prop in edge_vals:
-            style.removeProperty(prop.name)
-        style.setProperty('border', edge_vals[0].value)
-
-
-condensers: dict[str, Condenser] = {
-    'margin': simple_condenser('margin', condense_edge),
-    'padding': simple_condenser('padding', condense_edge),
-    'border': condense_border,
-}
-
-
-def condense_rule(style: CSSStyleDeclaration) -> None:
-    expanded: dict[str, list[Property]] = {'margin-': [], 'padding-': [], 'border-': []}
-    for prop in style.getProperties():
-        for x, t in expanded.items():
-            if prop.name and prop.name.startswith(x):
-                t.append(prop)
-                break
-    for prefix, vals in expanded.items():
-        if len(vals) > 1 and {x.priority for x in vals} == {''}:
-            condensers[prefix[:-1]](style, vals)
-
-
-def condense_sheet(sheet: CSSStyleSheet) -> None:
-    for rule in sheet.cssRules:
-        if rule.type == rule.STYLE_RULE:
-            condense_rule(rule.style)
+def condense_sheet(sheet: Stylesheet) -> None:
+    """Replace the longhands of margin, padding and border with shorthands
+    where that does not change their meaning, in the style rules of sheet"""
+    for rule in sheet.iter_rules(RuleType.STYLE):
+        condense_shorthands(rule.style)
 
 
 def test_normalization(return_tests: bool = False) -> unittest.TestSuite | None:  # {{{
     import unittest
-    from itertools import product
 
-    from css_parser import parseStyle
+    from kgcss import parse_stylesheet
 
     class TestNormalization(unittest.TestCase):
         longMessage = True
         maxDiff = None
 
         def test_font_normalization(self) -> None:
-            def font_dict(expected: dict[str, str]) -> dict[str, str | int]:
-                ans = {k: DEFAULTS[k] for k in font_composition} if expected else {}
+            font_composition = longhands('font')
+
+            def font_dict(expected: dict[str, str]) -> dict[str, str]:
+                ans = {k: SHORTHAND_INITIAL_VALUES[k] for k in font_composition}
                 ans.update(expected)
                 return ans
 
             for raw, expected in {
-                'some_font': {'font-family': 'some_font'},
-                'inherit': {k: 'inherit' for k in font_composition},
+                'inherit': dict.fromkeys(font_composition, 'inherit'),
                 '1.2pt/1.4 A_Font': {'font-family': 'A_Font', 'font-size': '1.2pt', 'line-height': '1.4'},
-                'bad font': {'font-family': '"bad font"'},
                 '10% serif': {'font-family': 'serif', 'font-size': '10%'},
                 '12px "My Font", serif': {'font-family': '"My Font", serif', 'font-size': '12px'},
                 'normal 0.6em/135% arial,sans-serif': {
@@ -403,28 +192,34 @@ def test_normalization(return_tests: bool = False) -> unittest.TestSuite | None:
                     'font-variant': 'small-caps',
                 },
                 '2em A B': {'font-family': '"A B"', 'font-size': '2em'},
+                # Keywords are case-insensitive (porting.md §6.7)
+                'BOLD 12px serif': {'font-family': 'serif', 'font-weight': 'bold', 'font-size': '12px'},
+                # default is quoted, as it is not a valid unquoted family name
+                '12px x, "default"': {'font-family': 'x, "default"', 'font-size': '12px'},
+                # Everything after the size is the family list
+                '12px bold serif': {'font-family': '"bold serif"', 'font-size': '12px'},
+                # The font shorthand also sets font-stretch (porting.md §6.9)
+                'condensed 12pt a': {'font-stretch': 'condensed', 'font-size': '12pt', 'font-family': 'a'},
+                # A legacy system font: the initial values
+                'caption': {},
             }.items():
-                val = tuple(parseStyle(f'font: {raw}', validate=False))[0].propertyValue
-                style = normalizers['font']('font', val)
-                self.assertDictEqual(font_dict(expected), style, raw)
+                self.assertDictEqual(font_dict(expected), normalize_shorthand('font', raw) or {}, raw)
+            # Values that do not match the grammar of the font shorthand (CSS
+            # Fonts 4) are not expanded: browsers ignore them
+            for raw in ('some_font', 'bad font', '12px inherit', '12px 1.4 serif', 'var(--f)'):
+                self.assertIsNone(normalize_shorthand('font', raw), raw)
 
         def test_border_normalization(self) -> None:
-            def border_edge_dict(expected: dict[str, str], edge: str = 'right') -> dict[str, str | int]:
-                ans = {f'border-{edge}-{x}': DEFAULTS[f'border-{edge}-{x}'] for x in ('style', 'width', 'color')}
+            def border_edge_dict(expected: dict[str, str], edge: str = 'right') -> dict[str, str]:
+                ans = {f'border-{edge}-{x}': SHORTHAND_INITIAL_VALUES[f'border-{edge}-{x}'] for x in ('width', 'style', 'color')}
                 for x, v in expected.items():
                     ans[f'border-{edge}-{x}'] = v
                 return ans
 
-            def border_dict(expected: dict[str, str]) -> dict[str, str | int]:
-                ans: dict[str, str | int] = {}
+            def border_dict(expected: dict[str, str]) -> dict[str, str]:
+                ans: dict[str, str] = {}
                 for edge in EDGES:
                     ans.update(border_edge_dict(expected, edge))
-                return ans
-
-            def border_val_dict(expected: str, val: str = 'color') -> dict[str, str | int]:
-                ans = {f'border-{edge}-{val}': DEFAULTS[f'border-{edge}-{val}'] for edge in EDGES}
-                for edge in EDGES:
-                    ans[f'border-{edge}-{val}'] = expected
                 return ans
 
             for raw, expected in {
@@ -432,28 +227,38 @@ def test_normalization(return_tests: bool = False) -> unittest.TestSuite | None:
                 '1px': {'width': '1px'},
                 '#aaa': {'color': '#aaa'},
                 '2em groove': {'width': '2em', 'style': 'groove'},
+                # Numbers without units are lengths, as in quirks mode
+                '1 solid': {'width': '1', 'style': 'solid'},
             }.items():
                 for edge in EDGES:
                     br = f'border-{edge}'
-                    val = tuple(parseStyle(f'{br}: {raw}', validate=False))[0].propertyValue
-                    self.assertDictEqual(border_edge_dict(expected, edge), normalizers[br](br, val))
+                    self.assertDictEqual(border_edge_dict(expected, edge), normalize_shorthand(br, raw) or {}, raw)
 
             for raw, expected in {
                 'solid 1px red': {'color': 'red', 'width': '1px', 'style': 'solid'},
                 '1px': {'width': '1px'},
                 '#aaa': {'color': '#aaa'},
                 'thin groove': {'width': 'thin', 'style': 'groove'},
+                'inherit': {'color': 'inherit', 'width': 'inherit', 'style': 'inherit'},
             }.items():
-                val = tuple(parseStyle('{}: {}'.format('border', raw), validate=False))[0].propertyValue
-                self.assertDictEqual(border_dict(expected), normalizers['border']('border', val))
+                self.assertDictEqual(border_dict(expected), normalize_shorthand('border', raw) or {}, raw)
 
             for name, val in {
-                'width': '10%',
                 'color': 'rgb(0, 1, 1)',
                 'style': 'double',
+                'width': '2px',
             }.items():
-                cval = tuple(parseStyle(f'border-{name}: {val}', validate=False))[0].propertyValue
-                self.assertDictEqual(border_val_dict(val, name), normalizers['border-' + name]('border-' + name, cval))
+                self.assertDictEqual({f'border-{edge}-{name}': val for edge in EDGES}, normalize_shorthand('border-' + name, val) or {})
+
+            # Invalid values are not expanded (porting.md §6.9)
+            for name, raw in {
+                'border': 'solid dotted',
+                'border-top': 'foo',
+                'border-color': 'red 1px',
+                # A percentage is not a border width
+                'border-width': '10%',
+            }.items():
+                self.assertIsNone(normalize_shorthand(name, raw), f'{name}: {raw}')
 
         def test_edge_normalization(self) -> None:
             def edge_dict(prefix: str, expected: Sequence[str]) -> dict[str, str]:
@@ -464,14 +269,23 @@ def test_normalization(return_tests: bool = False) -> unittest.TestSuite | None:
                 '1em 2em': ('1em', '2em', '1em', '2em'),
                 '1em 2em 3em': ('1em', '2em', '3em', '2em'),
                 '1 2 3 4': ('1', '2', '3', '4'),
+                'inherit': ('inherit',) * 4,
             }.items():
                 for prefix in ('margin', 'padding'):
-                    cval = tuple(parseStyle(f'{prefix}: {raw}', validate=False))[0].propertyValue
-                    self.assertDictEqual(edge_dict(prefix, expected), normalizers[prefix](prefix, cval))
+                    self.assertDictEqual(edge_dict(prefix, expected), normalize_shorthand(prefix, raw) or {}, raw)
+            self.assertDictEqual(edge_dict('margin', ('-1em', 'auto', '-1em', 'auto')), normalize_shorthand('margin', '-1em auto') or {})
+            # Invalid values are not expanded (porting.md §6.9)
+            for name, raw in {
+                'margin': '1px 2px 3px 4px 5px',
+                'padding': '-1px',
+                'padding-x': '1px',
+                'color': 'red',
+            }.items():
+                self.assertIsNone(normalize_shorthand(name, raw), f'{name}: {raw}')
 
         def test_list_style_normalization(self) -> None:
-            def ls_dict(expected: dict[str, str]) -> dict[str, str | int]:
-                ans: dict[str, str | int] = {f'list-style-{x}': DEFAULTS[f'list-style-{x}'] for x in ('type', 'image', 'position')}
+            def ls_dict(expected: dict[str, str]) -> dict[str, str]:
+                ans = {f'list-style-{x}': SHORTHAND_INITIAL_VALUES[f'list-style-{x}'] for x in ('type', 'position', 'image')}
                 for k, v in expected.items():
                     ans[f'list-style-{k}'] = v
                 return ans
@@ -480,13 +294,15 @@ def test_normalization(return_tests: bool = False) -> unittest.TestSuite | None:
                 'url(http://www.example.com/images/list.png)': {'image': 'url(http://www.example.com/images/list.png)'},
                 'inside square': {'position': 'inside', 'type': 'square'},
                 'upper-roman url(img) outside': {'position': 'outside', 'type': 'upper-roman', 'image': 'url(img)'},
+                'none': {'type': 'none', 'image': 'none'},
             }.items():
-                cval = tuple(parseStyle(f'list-style: {raw}', validate=False))[0].propertyValue
-                self.assertDictEqual(ls_dict(expected), normalizers['list-style']('list-style', cval))
+                self.assertDictEqual(ls_dict(expected), normalize_shorthand('list-style', raw) or {}, raw)
+            self.assertIsNone(normalize_shorthand('list-style', 'none none none'))
 
         def test_filter_css_normalization(self) -> None:
             ae = self.assertEqual
-            ae({'font'} | set(font_composition), normalize_filter_css({'font'}))
+            # The font shorthand also sets font-stretch
+            ae({'font', 'font-style', 'font-variant', 'font-weight', 'font-stretch', 'font-size', 'line-height', 'font-family'}, normalize_filter_css({'font'}))
             for p in ('margin', 'padding'):
                 ae({p} | {p + '-' + x for x in EDGES}, normalize_filter_css({p}))
             bvals = {f'border-{edge}-{x}' for edge in EDGES for x in BORDER_PROPS}
@@ -501,6 +317,12 @@ def test_normalization(return_tests: bool = False) -> unittest.TestSuite | None:
                 {'list-style', 'list-style-image', 'list-style-type', 'list-style-position'},
                 normalize_filter_css({'list-style'}),
             )
+            ae({'color', 'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left'}, normalize_filter_css(('color', 'margin')))
+
+        def condensed(self, css: str) -> str:
+            sheet = parse_stylesheet(css)
+            condense_sheet(sheet)
+            return sheet.css_text
 
         def test_edge_condensation(self) -> None:
             for s, v in {
@@ -514,38 +336,48 @@ def test_normalization(return_tests: bool = False) -> unittest.TestSuite | None:
                 tuple('0 0 0 0'.split()): '0',
             }.items():
                 for prefix in ('margin', 'padding'):
-                    css = {f'{prefix}-{x}': str(y) + 'pt' if isinstance(y, numbers.Number) else y for x, y in zip(('left', 'top', 'right', 'bottom'), s)}
-                    css = '; '.join((f'{k}:{v}' for k, v in css.items()))
-                    style = parseStyle(css)
-                    condense_rule(style)
-                    val = getattr(style.getProperty(prefix), 'value', None)
-                    self.assertEqual(v, val)
-                    if val is not None:
-                        for edge in EDGES:
-                            self.assertFalse(getattr(style.getProperty(f'{prefix}-{edge}'), 'value', None))
+                    css = {f'{prefix}-{x}': str(y) + 'pt' if isinstance(y, int) else y for x, y in zip(('left', 'top', 'right', 'bottom'), s)}
+                    decls = '; '.join(f'{k}:{v}' for k, v in css.items())
+                    sheet = parse_stylesheet(f'p {{ {decls} }}')
+                    condense_sheet(sheet)
+                    rule = sheet.rules[0]
+                    assert isinstance(rule, StyleRule)
+                    style = rule.style
+                    self.assertEqual(v or '', style.get_value(prefix))
+                    if v is not None:
+                        self.assertEqual([prefix], style.keys())
 
         def test_border_condensation(self) -> None:
             vals = 'red solid 5px'
             css = '; '.join(f'border-{edge}-{p}: {v}' for edge in EDGES for p, v in zip(BORDER_PROPS, vals.split()))
-            style = parseStyle(css)
-            condense_rule(style)
-            for e, p in product(EDGES, BORDER_PROPS):
-                self.assertFalse(style.getProperty(f'border-{e}-{p}'))
-                self.assertFalse(style.getProperty(f'border-{e}'))
-                self.assertFalse(style.getProperty(f'border-{p}'))
-            self.assertEqual(style.getProperty('border').value, vals)
-            css = '; '.join(f'border-{edge}-{p}: {v}' for edge in ('top',) for p, v in zip(BORDER_PROPS, vals.split()))
-            style = parseStyle(css)
-            condense_rule(style)
-            self.assertEqual(css_text(style).rstrip(';'), f'border-top: {vals}')
+            self.assertEqual(self.condensed(f'p {{ {css} }}'), f'p {{\n  border: {vals};\n}}')
+            css = '; '.join(f'border-top-{p}: {v}' for p, v in zip(BORDER_PROPS, vals.split()))
+            self.assertEqual(self.condensed(f'p {{ {css} }}'), f'p {{\n  border-top: {vals};\n}}')
             css += ';' + '; '.join(
                 f'border-{edge}-{p}: {v}' for edge in ('right', 'left', 'bottom') for p, v in zip(BORDER_PROPS, vals.replace('red', 'green').split())
             )
-            style = parseStyle(css)
-            condense_rule(style)
-            self.assertEqual(len(style.getProperties()), 4)
-            self.assertEqual(style.getProperty('border-top').value, vals)
-            self.assertEqual(style.getProperty('border-left').value, vals.replace('red', 'green'))
+            sheet = parse_stylesheet(f'p {{ {css} }}')
+            condense_sheet(sheet)
+            rule = sheet.rules[0]
+            assert isinstance(rule, StyleRule)
+            style = rule.style
+            self.assertEqual(len(style), 4)
+            self.assertEqual(style['border-top'], vals)
+            self.assertEqual(style['border-left'], vals.replace('red', 'green'))
+
+        def test_sheet_condensation(self) -> None:
+            edges = 'margin-top: 1px; margin-right: 1px; margin-bottom: 1px; margin-left: 1px'
+            # Style rules at any depth are condensed
+            self.assertEqual(
+                self.condensed(f'@media screen {{ @supports (display: grid) {{ p {{ {edges} }} }} }}'),
+                '@media screen {\n  @supports (display: grid) {\n    p {\n      margin: 1px;\n    }\n  }\n}',
+            )
+            # Not when that could change the meaning: !important, or an
+            # overlapping shorthand
+            css = f'p {{\n  {edges.replace("; ", " !important;\n  ")} !important;\n}}'
+            self.assertEqual(self.condensed(css), css)
+            css = f'p {{\n  margin: 0;\n  {edges.replace("; ", ";\n  ")};\n}}'
+            self.assertEqual(self.condensed(css), css)
 
     tests = unittest.defaultTestLoader.loadTestsFromTestCase(TestNormalization)
     if return_tests:

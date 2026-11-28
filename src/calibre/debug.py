@@ -8,7 +8,7 @@ Embedded console for debugging.
 import functools
 import os
 import sys
-from typing import IO, TYPE_CHECKING, TypedDict, Unpack, cast
+from typing import IO, TYPE_CHECKING, Unpack, cast
 
 from calibre import prints
 from calibre.constants import iswindows
@@ -21,11 +21,7 @@ if TYPE_CHECKING:
     import subprocess
     from types import ModuleType
 
-    class PopenKwargs(TypedDict, total=False):
-        stdin: int | IO[bytes] | None
-        stdout: int | IO[bytes] | None
-        stderr: int | IO[bytes] | None
-        creationflags: int
+    from calibre.type_hints import PopenKwargs
 
     class DebugPopenKwargs(PopenKwargs, total=False):
         headless: bool
@@ -361,13 +357,15 @@ def print_basic_debug_info(out: IO[str] | None = None) -> None:
         pass
     pr('Interface language:', str(set_translators.lang))
     pr('EXE path:', sys.executable)
-    from calibre.customize.ui import has_external_plugins, initialized_plugins
+    from calibre.customize.ui import has_external_plugins, ignored_plugins, initialized_plugins
 
     if has_external_plugins():
         from calibre.customize import PluginInstallationType
 
         names = (f'{p.name} {p.version}' for p in initialized_plugins() if getattr(p, 'installation_type', None) is not PluginInstallationType.BUILTIN)
         pr('Successfully initialized third party plugins:', ' && '.join(names))
+    if ip := ignored_plugins():
+        pr('Ignored third party plugins:', ' && '.join(ip))
 
 
 def run_debug_gui(logpath: str) -> None:

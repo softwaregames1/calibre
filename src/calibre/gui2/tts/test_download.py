@@ -21,6 +21,18 @@ if TYPE_CHECKING:
 DATA = b'voice model data' * 64 * 5
 
 
+# Paths whose first response is interrupted by closing the connection rather
+# than by stalling. Tests using them do not rely on the transfer timeout, so
+# they can use a long one and get a deterministic number of requests even on
+# loaded machines.
+DISCONNECT_AFTER_FIRST_CHUNK = frozenset(('/range-disconnect', '/range-wrong-offset', '/range-wrong-length', '/range-changed-validator'))
+# Paths whose later responses are rejected by the client. The connection is
+# left open for the client to abort, closing it immediately races with Qt,
+# which transparently resends the request if it notices the closed
+# connection before reading the response, adding a request to the count.
+REJECTED_AFTER_FIRST_CHUNK = DISCONNECT_AFTER_FIRST_CHUNK - {'/range-disconnect'}
+
+
 class DownloadServer(ThreadingHTTPServer):
     def __init__(self) -> None:
         self.stopped = Event()
@@ -113,11 +125,13 @@ class DownloadHandler(BaseHTTPRequestHandler):
                 }:
                     self.wfile.write(DATA[start : start + 1024])
                     self.wfile.flush()
-                    if self.path != '/range-disconnect':
+                    if self.path not in DISCONNECT_AFTER_FIRST_CHUNK:
                         stopped.wait(10)
                 else:
                     self.wfile.write(DATA[start : end + 1])
                     self.wfile.flush()
+                    if self.path in REJECTED_AFTER_FIRST_CHUNK:
+                        stopped.wait(10)
             except BrokenPipeError, ConnectionResetError:
                 return
             return
@@ -185,8 +199,9 @@ def run_download_tests_in_worker() -> None:
 
         def use_long_transfer_timeout(self) -> None:
             # For tests that must not time out. The short default timeout is
-            # too close to the gaps between chunks of /slow on loaded CI
-            # machines. This costs nothing as these downloads never stall.
+            # too close to the gaps between chunks of /slow or to the latency
+            # of a retried request on loaded CI machines. This costs nothing
+            # as these downloads never stall.
             p = patch.object(NetworkAccessManager, 'MAX_TRANSFER_TIMEOUT_MS', 5000)
             p.start()
             self.addCleanup(p.stop)
@@ -351,6 +366,7 @@ def run_download_tests_in_worker() -> None:
             self.assertEqual(self.server.requests[1][1:], ('bytes=1024-', '"model-v1"'))
 
         def test_resume_after_disconnect(self) -> None:
+            self.use_long_transfer_timeout()
             self.run_download('range-disconnect')
             self.assert_downloaded('range-disconnect')
             self.assertEqual(self.server.requests[1][1], 'bytes=1024-')
@@ -379,6 +395,7 @@ def run_download_tests_in_worker() -> None:
             self.assertEqual([r for _, r, _ in self.server.requests], ['', ''])
 
         def test_wrong_range_preserves_existing_cache(self) -> None:
+            self.use_long_transfer_timeout()
             path = os.path.join(self.directory.name, 'range-wrong-offset')
             with open(path, 'wb') as stream:
                 stream.write(b'existing cache')
@@ -390,6 +407,7 @@ def run_download_tests_in_worker() -> None:
             self.assertEqual(os.listdir(self.directory.name), ['range-wrong-offset'])
 
         def test_inconsistent_range_length(self) -> None:
+            self.use_long_transfer_timeout()
             dialog = self.run_download('range-wrong-length')
             self.assert_failed(dialog)
             self.assertEqual(len(self.server.requests), 2)
@@ -424,6 +442,7 @@ def run_download_tests_in_worker() -> None:
             self.assertEqual(os.listdir(self.directory.name), [])
 
         def test_unhashed_resource_validator_changes(self) -> None:
+            self.use_long_transfer_timeout()
             dialog = self.run_download('range-changed-validator', verified=False)
             self.assert_failed(dialog)
             self.assertEqual(len(self.server.requests), 2)

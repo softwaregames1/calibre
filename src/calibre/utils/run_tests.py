@@ -21,6 +21,7 @@ from polyglot.binary import as_hex_unicode
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterable, Iterator
+    from importlib.resources.abc import Traversable
     from subprocess import Popen
 
     from _typeshed import OptExcInfo
@@ -141,12 +142,10 @@ def itertests(suite: unittest.TestSuite) -> Iterator[unittest.TestCase]:
 
 def init_env() -> None:
     from calibre.ebooks.metadata.book.base import reset_field_metadata
-    from calibre.ebooks.oeb.polish.utils import setup_css_parser_serialization
     from calibre.utils.config_base import reset_tweaks_to_default
 
     reset_tweaks_to_default()
     reset_field_metadata()
-    setup_css_parser_serialization()
 
 
 def filter_tests(suite: unittest.TestSuite, test_ok: Callable[[unittest.TestCase], bool]) -> unittest.TestSuite:
@@ -652,28 +651,36 @@ def run_parallel(suite: unittest.TestSuite, num_workers: int = 0, worker_cmd: li
 
 
 class TestImports(unittest.TestCase):
-    def base_check(self, base: str, exclude_packages: set[str], exclude_modules: set[str]) -> int:
-        import importlib
-
-        import_base = os.path.dirname(base)
+    def base_check(self, package: str, exclude_packages: set[str], exclude_modules: set[str]) -> int:
+        # Use importlib.resources rather than os.walk so that this works in
+        # frozen builds as well, where modules are stored as .pyc files in
+        # an archive rather than as .py files on the filesystem.
+        module_exts = ('py', 'pyc')
         count = 0
-        for root, dirs, files in os.walk(base):
-            for d in tuple(dirs):
-                if not os.path.isfile(os.path.join(root, d, '__init__.py')):
-                    dirs.remove(d)
-            for fname in files:
-                module_name, ext = os.path.splitext(fname)
-                if ext != '.py':
+
+        def is_package(node: Traversable) -> bool:
+            return any(node.joinpath(f'__init__.{e}').is_file() for e in module_exts)
+
+        def walk(node: Traversable, package: str) -> None:
+            nonlocal count
+            modules, subpackages = set(), []
+            for child in sorted(node.iterdir(), key=lambda x: x.name):
+                if child.is_dir():
+                    if is_package(child):
+                        subpackages.append((child, f'{package}.{child.name}'))
                     continue
-                path = os.path.join(root, module_name)
-                relpath = os.path.relpath(path, import_base).replace(os.sep, '/')
-                full_module_name = '.'.join(relpath.split('/'))
-                if full_module_name.endswith('.__init__'):
-                    full_module_name = full_module_name.rpartition('.')[0]
+                module_name, sep, ext = child.name.rpartition('.')
+                if sep and ext in module_exts:
+                    modules.add(package if module_name == '__init__' else f'{package}.{module_name}')
+            for full_module_name in sorted(modules):
                 if full_module_name in exclude_modules or ('.' in full_module_name and full_module_name.rpartition('.')[0] in exclude_packages):
                     continue
                 importlib.import_module(full_module_name)
                 count += 1
+            for child, name in subpackages:
+                walk(child, name)
+
+        walk(importlib.resources.files(package), package)
         return count
 
     def test_import_of_all_python_modules(self) -> None:
@@ -697,11 +704,8 @@ class TestImports(unittest.TestCase):
             exclude_packages.add('calibre.gui2.tts')
         if not isbsd:
             exclude_modules.add('calibre.devices.usbms.hal')
-        d = os.path.dirname
-        SRC = d(d(d(os.path.abspath(__file__))))
-        self.assertGreater(self.base_check(os.path.join(SRC, 'odf'), exclude_packages, exclude_modules), 10)
-        base = os.path.join(SRC, 'calibre')
-        self.assertGreater(self.base_check(base, exclude_packages, exclude_modules), 1000)
+        self.assertGreater(self.base_check('odf', exclude_packages, exclude_modules), 10)
+        self.assertGreater(self.base_check('calibre', exclude_packages, exclude_modules), 1000)
 
         # Virtual imports for legacy compatibility
         import calibre.web.feeds.feedparser as f  # type: ignore
@@ -750,7 +754,10 @@ def find_tests(which_tests: Collection[str] | None = None, exclude_tests: Collec
 
         a(suite())
     if ok('css'):
-        from tinycss.tests.main import find_tests
+        from calibre.ebooks.oeb.stylizer import find_tests
+
+        a(find_tests())
+        from calibre.ebooks.oeb.css_test import find_tests
 
         a(find_tests())
         from calibre.ebooks.oeb.normalize_css import test_normalization
@@ -762,7 +769,7 @@ def find_tests(which_tests: Collection[str] | None = None, exclude_tests: Collec
         from calibre.ebooks.html_transform_rules import test
 
         a(test(return_tests=True))
-        from css_selectors.tests import find_tests
+        from calibre.ebooks.css_selectors_test import find_tests
 
         a(find_tests())
     if ok('docx'):
@@ -835,6 +842,9 @@ def find_tests(which_tests: Collection[str] | None = None, exclude_tests: Collec
         from calibre.ebooks.conversion.plugins.txt_input import find_tests
 
         a(find_tests())
+        from calibre.ebooks.conversion.plugins.fb2_input import find_tests
+
+        a(find_tests())
         from calibre.ebooks.txt.txtml import find_tests
 
         a(find_tests())
@@ -859,6 +869,12 @@ def find_tests(which_tests: Collection[str] | None = None, exclude_tests: Collec
         from calibre.ebooks.metadata.epub import find_tests
 
         a(find_tests())
+        from calibre.ebooks.metadata.docx import find_tests
+
+        a(find_tests())
+        from calibre.ebooks.metadata.odt import find_tests
+
+        a(find_tests())
         from calibre.ebooks.metadata.xmp import find_tests
 
         a(find_tests())
@@ -880,6 +896,15 @@ def find_tests(which_tests: Collection[str] | None = None, exclude_tests: Collec
         from calibre.gui2.library.test_annotations import find_tests
 
         a(find_tests())
+        from calibre.gui2.tweak_book.test_undo import find_tests
+
+        a(find_tests())
+        from calibre.gui2.tweak_book.editor.syntax.css import find_tests
+
+        a(find_tests())
+        from calibre.gui2.tweak_book.live_css import find_tests
+
+        a(find_tests())
         from calibre.gui2.tag_mapper import find_tests
 
         a(find_tests())
@@ -893,6 +918,9 @@ def find_tests(which_tests: Collection[str] | None = None, exclude_tests: Collec
 
         a(find_tests())
         from calibre.ebooks.pdf.reflow_test import find_tests
+
+        a(find_tests())
+        from calibre.ebooks.pdf.pdftohtml_test import find_tests
 
         a(find_tests())
         from calibre.spell.dictionary import find_tests

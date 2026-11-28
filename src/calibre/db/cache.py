@@ -1148,6 +1148,13 @@ class Cache:
     @overload
     def all_field_for(self, field: Literal['identifiers'], book_ids: Iterable[int], default_value: object = None) -> dict[int, dict[str, str]]: ...
     @overload
+    # title is NOT NULL in the database so it is always a string for valid book ids
+    def all_field_for(self, field: Literal['title'], book_ids: Iterable[int]) -> dict[int, str]: ...
+    @overload
+    def all_field_for(self, field: StrFieldName, book_ids: Iterable[int]) -> dict[int, str | None]: ...
+    @overload
+    def all_field_for[D](self, field: StrFieldName, book_ids: Iterable[int], default_value: D) -> dict[int, str | D]: ...
+    @overload
     def all_field_for(self, field: str, book_ids: Iterable[int]) -> dict[int, FieldValue]: ...
     @overload
     def all_field_for[D](self, field: str, book_ids: Iterable[int], default_value: D) -> dict[int, FieldValue | D]: ...
@@ -3691,7 +3698,7 @@ class Cache:
     _get_books_for_category = get_books_for_category
 
     @read_api
-    def split_if_is_multiple_composite(self, f: str, val: str) -> str | list[str]:
+    def split_if_is_multiple_composite[T](self, f: str, val: T) -> T | list[str]:
         """
         If f is a composite column lookup key and the column is is_multiple then
         split v into unique non-empty values. The comparison is case sensitive.
@@ -3701,7 +3708,7 @@ class Cache:
         fm = self.field_metadata.get(f, None)
         if fm and fm['datatype'] == 'composite' and fm['is_multiple']:
             sep = fm['is_multiple'].get('cache_to_list', ',')
-            return list({v.strip() for v in val.split(sep) if v.strip()})
+            return list({v.strip() for v in cast('str', val).split(sep) if v.strip()})
         return val
 
     _split_if_is_multiple_composite = split_if_is_multiple_composite

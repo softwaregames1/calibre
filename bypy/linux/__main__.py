@@ -47,12 +47,10 @@ def binary_includes():
              ' hwy hwy_contrib'
              ).split()
         )) + [
-            # debian/ubuntu for for some typical stupid reason use libpcre.so.3
-            # instead of libpcre.so.0 like other distros. And Qt's idiotic build
-            # system links against this pcre library despite being told to use
-            # the bundled pcre. Since libpcre doesn't depend on anything other
-            # than libc and libpthread we bundle the Ubuntu one here
-            glob.glob('/usr/lib/*/libpcre.so.3')[0],
+            # Qt uses its own statically linked bundled pcre2, but glib links
+            # against the system libpcre2-8. Since libpcre2-8 doesn't depend on
+            # anything other than libc we bundle the system one here.
+            glob.glob('/usr/lib/*/libpcre2-8.so.0')[0],
 
             get_dll_path('bz2', 2), j(PREFIX, 'lib', 'libunrar.so'), get_dll_path('sqlite3', 0),
             get_dll_path('python' + py_ver, 2), get_dll_path('jbig', 2),
@@ -89,11 +87,13 @@ def ignore_in_lib(base, items, ignored_dirs=None):
     for name in items:
         path = j(base, name)
         is_kakasi = 'pykakasi' in path
+        is_chardet_models = '/chardet/models' in base
         if os.path.isdir(path):
             if name != 'plugins' and (name in ignored_dirs or not is_package_dir(path)) and not (is_kakasi and name == 'data'):
                 ans.append(name)
         else:
-            if name.rpartition('.')[-1] not in ('so', 'py') and not (is_kakasi and name.endswith('.db')):
+            if name.rpartition('.')[-1] not in ('so', 'py') and not (is_kakasi and name.endswith('.db')) and not (
+                    is_chardet_models and name.endswith('.bin')):
                 ans.append(name)
     return ans
 

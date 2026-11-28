@@ -22,7 +22,7 @@ import unittest
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
-from calibre.constants import cache_dir, iswindows
+from calibre.constants import cache_dir, ismacos, iswindows
 from calibre.web.automate import camoufox, download_deps
 from calibre.web.automate.download_deps import (
     VERSION_LOCK_SUFFIX,
@@ -1110,6 +1110,17 @@ class TestCamoufoxKeyboard(unittest.TestCase):
             plan = camoufox.human_typing_plan(text, rng=random.Random(seed))
             self.assertFalse([k for k in plan if k.key == 'Backspace'])
 
+    def test_repeated_keys(self) -> None:
+        # A key the browser auto repeated, or one with a repeat of it dropped
+        self.assertTrue(camoufox.has_repeated_keys('edited', 'edddddited'))
+        self.assertTrue(camoufox.has_repeated_keys('hello', 'helo'))
+        self.assertTrue(camoufox.has_repeated_keys('a\nb', 'a\n\nb'))
+        # but not text that came out right, or that the page changed
+        self.assertFalse(camoufox.has_repeated_keys('edited', 'edited'))
+        self.assertFalse(camoufox.has_repeated_keys('', ''))
+        self.assertFalse(camoufox.has_repeated_keys('edited', 'EDITED'))
+        self.assertFalse(camoufox.has_repeated_keys('5551234', '555-1234'))
+
     def test_hands_and_neighbours(self) -> None:
         self.assertEqual(camoufox.key_hand('f'), 'left')
         self.assertEqual(camoufox.key_hand('j'), 'right')
@@ -1300,6 +1311,13 @@ class TestCamoufoxBrowser(unittest.TestCase):
                     os.killpg(browser_pid, 0)
                 except ProcessLookupError:
                     return False
+                except PermissionError:
+                    # macOS fails with EPERM rather than ESRCH when every
+                    # process left in the group is a zombie, the group is
+                    # ours so this cannot mean someone else's live process
+                    if ismacos:
+                        return False
+                    raise
                 return True
 
             deadline = time.monotonic() + 30
@@ -1311,7 +1329,7 @@ class TestCamoufoxBrowser(unittest.TestCase):
                 p.kill()
                 p.wait(10)
             if browser_pid:
-                with contextlib.suppress(ProcessLookupError):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(browser_pid, signal.SIGKILL)
             p.stdin.close()
             p.stdout.close()
@@ -1769,9 +1787,35 @@ class TestCamoufoxBrowser(unittest.TestCase):
             self.assertIn('still runs JavaScript', str(ctx.exception))
             self.assertFalse(page.input_wedged)
             self.assertFalse(page.keyboard.pressed, 'a key the page may never have seen released is still held down')
-            # so typing again, into what is there now, works
+            # The keys given up on still reached the browser and may be
+            # dispatched to the page at any time from now on, so wait for them
+            # to land before replacing the text, lest they arrive after it has
+            # been cleared and end up in front of the new text
+            deadline = time.monotonic() + 30
+            for _ in itertools.count():
+                value = await page.evaluate('document.getElementById("text").value')
+                if value == 'xy' or time.monotonic() > deadline:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(value, 'xy', 'the keys whose answers were lost never reached the page')
+            # so typing again, into what is there now, works. What the page
+            # sees is recorded, since replacing the text has been seen to leave
+            # the keys given up on in front of the new text on a slow CI machine,
+            # even though they had already landed, for reasons not yet known.
+            await page.evaluate('''(() => {
+                window.__seen = [];
+                const field = document.getElementById("text");
+                const note = (e) => window.__seen.push([
+                    e.type, e.key ?? e.inputType ?? '', e.ctrlKey ?? '', field.value, field.selectionStart, field.selectionEnd,
+                    document.activeElement?.id ?? '', document.hasFocus()]);
+                for (const type of ['keydown', 'keyup', 'keypress', 'input', 'mousedown', 'mouseup', 'focus', 'blur', 'select'])
+                    window.addEventListener(type, note, true);
+            })()''')
             await page.fill('#text', 'typed again')
-            self.assertEqual(await page.evaluate('document.getElementById("text").value'), 'typed again')
+            value = await page.evaluate('document.getElementById("text").value')
+            if value != 'typed again':
+                seen = '\n'.join(map(repr, await page.evaluate('window.__seen')))
+                self.fail(f'Typing again produced {value!r} instead of {"typed again"!r}. The page saw:\n{seen}')
 
         self.run_shared(check)
 
@@ -1796,6 +1840,12 @@ class TestCamoufoxBrowser(unittest.TestCase):
             # rare, a movement that ignores the budget does so on every try.
             attempts: list[tuple[float, float]] = []
             for attempt in range(4):
+                if attempt:
+                    # A click that follows the previous attempt's within the
+                    # double click time is the second click of a double click
+                    # on Windows, adding a dblclick event, so wait that out.
+                    # The Windows default is 500ms.
+                    await asyncio.sleep(1.5)
                 probe = time.monotonic()
                 for i in range(6):
                     await page.mouse.move(20 + 10 * i, 20, human=False)
@@ -1882,6 +1932,35 @@ class TestCamoufoxBrowser(unittest.TestCase):
             await page.fill('#rich', 'edited', click=False)
             self.assertEqual(await page.evaluate('document.getElementById("rich").textContent'), 'edited')
 
+            # A key the browser auto repeats, as it has been seen to on a
+            # heavily loaded machine, is noticed and the text typed again
+            keyboard = page.keyboard
+            down = keyboard.down
+            repeated: list[str] = []
+
+            async def down_repeating(key: str, *, repeat: bool = False) -> None:
+                await down(key, repeat=repeat)
+                if key == 'd' and not repeated:
+                    repeated.append(key)
+                    for _ in range(4):
+                        await down(key, repeat=True)
+
+            with patch.object(keyboard, 'down', down_repeating):
+                await page.fill('#rich', 'edited', click=False)
+            self.assertEqual(repeated, ['d'])
+            self.assertEqual(await page.evaluate('document.getElementById("rich").textContent'), 'edited')
+
+            # and one that repeats every time fails rather than leaving the
+            # wrong text behind
+            async def down_always_repeating(key: str, *, repeat: bool = False) -> None:
+                await down(key, repeat=repeat)
+                if key == 'd':
+                    await down(key, repeat=True)
+
+            with patch.object(keyboard, 'down', down_always_repeating):
+                with self.assertRaisesRegex(camoufox.Error, 'with keys repeated every time'):
+                    await page.fill('#rich', 'edited', click=False)
+
             # Mistakes are corrected as they are made, so the text still ends
             # up right. Noticing a mistake and going back over it are pauses of
             # a fixed length rather than ones that scale with the typing speed,
@@ -1890,6 +1969,33 @@ class TestCamoufoxBrowser(unittest.TestCase):
             with patch.object(camoufox, 'MISTAKE_NOTICE', (0.01, 0.02)), patch.object(camoufox, 'MISTAKE_REPAIR', (0.01, 0.02)):
                 await page.fill('#text', 'corrected', mistakes=1.0)
             self.assertEqual(await page.evaluate('document.getElementById("text").value'), 'corrected')
+
+            # A modifier the browser lets go of before the key it modifies
+            # turns select all into a plain key that is typed, which is noticed
+            # and select all pressed again, so the text is still replaced
+            keyboard = page.keyboard
+            press = keyboard.press
+            dropped: list[str] = []
+
+            async def press_dropping_modifier(key: str, *, delay: float | None = None, count: int = 1) -> None:
+                if key == camoufox.SELECT_ALL_CHORD and not dropped:
+                    dropped.append(key)
+                    key = SELECT_ALL_KEY
+                await press(key, delay=delay, count=count)
+
+            with patch.object(keyboard, 'press', press_dropping_modifier):
+                await page.fill('#text', 'replaced')
+            self.assertEqual(dropped, [camoufox.SELECT_ALL_CHORD])
+            self.assertEqual(await page.evaluate('document.getElementById("text").value'), 'replaced')
+
+            # and one that never selects anything fails rather than leaving the
+            # old text in front of the new
+            async def press_always_dropping_modifier(key: str, *, delay: float | None = None, count: int = 1) -> None:
+                await press(SELECT_ALL_KEY if key == camoufox.SELECT_ALL_CHORD else key, delay=delay, count=count)
+
+            with patch.object(keyboard, 'press', press_always_dropping_modifier):
+                with self.assertRaisesRegex(camoufox.Error, 'did not select everything'):
+                    await page.fill('#text', 'never')
 
         self.run_shared(check)
 

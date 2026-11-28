@@ -133,10 +133,9 @@ class HTMLInput(InputFormatPlugin):
         return self._is_case_sensitive
 
     def create_oebbook(self, htmlpath: str, basedir: str, opts: Values, log: Log, mi: Metadata) -> OEBBook:
-        import logging
         import uuid
 
-        import css_parser
+        from kgcss import Stylesheet, replace_urls
         from lxml import etree
 
         from calibre import guess_type
@@ -148,7 +147,6 @@ class HTMLInput(InputFormatPlugin):
         from calibre.utils.localization import canonicalize_lang
 
         self.opts = opts
-        css_parser.log.setLevel(logging.WARNING)
         self.OEB_STYLES = OEB_STYLES
         # reader is unused when populate is False
         oeb = create_oebbook(log, None, opts, self, encoding=opts.input_encoding, populate=False)  # ty: ignore[invalid-argument-type]
@@ -201,6 +199,11 @@ class HTMLInput(InputFormatPlugin):
         self.log = log
         self.log('Normalizing filename cases')
         for path, href in htmlfile_map.items():
+            # Normalize the same way as link_to_local_path() so that links to
+            # the HTML files are recognized. Otherwise, for example, on Windows
+            # with an 8.3 short name in the path, realpath() expands it and
+            # the link target is added as a duplicate resource.
+            path = os.path.abspath(os.path.realpath(path))
             if not self.is_case_sensitive(path):
                 path = path.lower()
             self.added_resources[path] = href
@@ -225,7 +228,10 @@ class HTMLInput(InputFormatPlugin):
 
         while self.stylesheets_to_process:
             sheet = self.stylesheets_to_process.pop()
-            css_parser.replaceUrls(sheet.data, partial(self.resource_adder, base=sheet.html_input_dirpath))
+            data = sheet.data
+            assert isinstance(data, Stylesheet)  # only stylesheets are added to stylesheets_to_process
+            # Links that resource_adder() ignores, returning None, are left as they are
+            replace_urls(data, partial(self.resource_adder, base=sheet.html_input_dirpath))
         for item in oeb.manifest:
             if item.media_type in self.OEB_STYLES:
                 item.resolve_css_imports = True

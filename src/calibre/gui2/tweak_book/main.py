@@ -5,18 +5,18 @@ import importlib
 import os
 import sys
 import time
+from typing import cast
 
 from qt.core import QIcon, sip
 
 from calibre.constants import EDITOR_APP_UID, islinux, ismacos
-from calibre.ebooks.oeb.polish.check.css import shutdown as shutdown_css_check_pool
 from calibre.gui2 import Application, decouple, set_gui_prefs, setup_gui_option_parser
 from calibre.ptempfile import reset_base_dir
 from calibre.utils.config import OptionParser
 from calibre.utils.localization import _
 
 
-def option_parser():
+def option_parser() -> OptionParser:
     parser = OptionParser(
         _(
             '''\
@@ -32,11 +32,12 @@ files inside the book which will be opened for editing automatically.
     return parser
 
 
-def gui_main(path=None, notify=None) -> None:
-    _run(['ebook-edit', path], notify=notify)
+def gui_main(path: str | None = None, notify: str | None = None) -> None:
+    # path is always specified by callers, a None path would fail in parse_args()
+    _run(cast('list[str]', ['ebook-edit', path]), notify=notify)
 
 
-def _run(args, notify=None) -> None:
+def _run(args: list[str], notify: str | None = None) -> None:
     from calibre.utils.webengine import setup_fake_protocol
 
     # Ensure we can continue to function if GUI is closed
@@ -100,11 +101,8 @@ def _run(args, notify=None) -> None:
     gc.collect(), gc.collect()
 
 
-def main(args=sys.argv) -> None:
-    try:
-        _run(args)
-    finally:
-        shutdown_css_check_pool()
+def main(args: list[str] = sys.argv) -> None:
+    _run(args)
 
 
 if __name__ == '__main__':

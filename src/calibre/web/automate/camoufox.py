@@ -1508,6 +1508,14 @@ FOCUSED_IS_EDITABLE_JS = '''() => {
     return !node.disabled && !node.readOnly && !uneditable.includes(kind);
 }'''
 
+# Whether everything a form field holds is selected, so that deleting the
+# selection empties it, see Element.fill(). Only a text field reports where its
+# selection lies precisely enough to tell, so anything else is taken on trust.
+SELECTS_ALL_JS = '''(node) => {
+    if (typeof node.value !== 'string' || typeof node.selectionStart !== 'number') return true;
+    return node.selectionStart === 0 && node.selectionEnd === node.value.length;
+}'''
+
 # Scripts run behind Xray wrappers, which forbid reading the contents of a typed
 # array, so the bytes are turned into base64 by the browser itself rather than by
 # walking a Uint8Array. It has to be an async function because the promise
@@ -2072,6 +2080,23 @@ MODIFIER_KEY_NAMES = ('Shift', 'Control', 'Alt', 'Meta')
 # depends on the machine the browser actually runs on, not on the operating
 # system its fingerprint claims, since the key handling is the real one.
 SELECT_ALL_CHORD = 'meta+a' if ismacos else 'control+a'
+# How many times select all is pressed before replacing text gives up
+SELECT_ALL_ATTEMPTS = 3
+# How many times replacing text types it out when a key came out repeated
+FILL_ATTEMPTS = 3
+
+
+def collapse_repeats(text: str) -> str:
+    """text with every run of the same character reduced to a single one."""
+    return re.sub(r'(.)\1+', r'\1', text, flags=re.DOTALL)
+
+
+def has_repeated_keys(typed: str, value: str) -> bool:
+    """Whether value is typed with some of its keys pressed a different number
+    of times, the way a key the browser auto repeated comes out, see
+    :meth:`Element.fill`."""
+    return value != typed and collapse_repeats(value) == collapse_repeats(typed)
+
 
 DEFAULT_TYPING_WPM = 55.0  # words per minute, a moderately quick typist who is not a professional one
 CHARS_PER_WORD = 5.0  # the conventional definition of a word when measuring typing speed
@@ -2775,7 +2800,10 @@ class Element:
         accelerator and deleted rather than being assigned from JavaScript, so
         that a page which watches for key and input events, as anything built
         on a JavaScript framework does, sees what it is expecting. Pass an empty
-        string to only clear it.
+        string to only clear it. Raises :class:`Error` if what is in a text
+        field cannot be selected, rather than typing in front of it. A key that
+        comes out repeated, or with a repeat missing, is noticed and the text
+        typed again.
         """
         self.page.check_accepts_input()
         if click:
@@ -2783,9 +2811,39 @@ class Element:
         else:
             await self.focus()
         keyboard = self.page.keyboard
-        await keyboard.press(SELECT_ALL_CHORD)
+        for attempt in range(FILL_ATTEMPTS):
+            await self.clear()
+            await keyboard.type(text, wpm=wpm, delay=delay, human=human, mistakes=mistakes)
+            # A key the browser auto repeats, or one it drops a repeat of,
+            # which has been seen to happen on a heavily loaded Windows
+            # machine, leaves a character in the field more or fewer times than
+            # it was typed, so check and type it all again, as a hand would.
+            # Anything else that is different is taken to be the page's doing,
+            # a field that formats what is typed into it, say, and left alone.
+            if not has_repeated_keys(text, value := await self.value()):
+                break
+            debug(f'Typing {text!r} into {self!r} produced {value!r} on attempt {attempt + 1}')
+        else:
+            raise Error(f'Typing {text!r} into {self!r} {FILL_ATTEMPTS} times produced {value!r} with keys repeated every time')
+
+    async def clear(self) -> None:
+        """Select everything in this element, which must already be focused, and delete it.
+
+        Raises :class:`Error` if what is in a text field cannot be selected.
+        """
+        keyboard = self.page.keyboard
+        # A modifier the browser lets go of early, which has been seen to
+        # happen on a heavily loaded machine, turns the chord into a plain key
+        # that is typed rather than selecting anything, so check that
+        # everything was selected and try again, as a hand would, if it was not
+        for attempt in range(SELECT_ALL_ATTEMPTS):
+            await keyboard.press(SELECT_ALL_CHORD)
+            if await self.call(SELECTS_ALL_JS):
+                break
+            debug(f'Pressing {SELECT_ALL_CHORD} did not select everything in {self!r} on attempt {attempt + 1}')
+        else:
+            raise Error(f'Pressing {SELECT_ALL_CHORD} {SELECT_ALL_ATTEMPTS} times did not select everything in {self!r}, so its contents cannot be replaced')
         await keyboard.press('Backspace')
-        await keyboard.type(text, wpm=wpm, delay=delay, human=human, mistakes=mistakes)
 
     async def dispose(self) -> None:
         if self.disposed:
@@ -2808,6 +2866,9 @@ class Page:
         self.main_frame = ''
         self.url = 'about:blank'
         self.closed = False
+        # Set when the browser reports that the tab is gone, which happens
+        # some time after it acknowledges the request to close it
+        self.gone = asyncio.Event()
         self.events = EventWaiter()
         self.ready = asyncio.Event()
         # frame id -> id of the execution context for the main JavaScript world
@@ -2894,6 +2955,7 @@ class Page:
 
     def detached(self) -> None:
         self.closed = True
+        self.gone.set()
         self.events.abort(BrowserClosedError('The page was closed'))
         self.ready.set()
 
@@ -3524,6 +3586,15 @@ class Page:
             await self.send('Page.close', {'runBeforeUnload': False}, timeout=CLOSE_TIMEOUT)
         except Error, ProtocolError:
             pass
+        else:
+            # The browser acknowledges the request before it closes the tab,
+            # so wait for it to be gone. A tab opened while another is still
+            # being closed can then never be caught up in the closing, which
+            # has been seen to leave Browser.newPage hanging on Windows.
+            try:
+                await wait_for(asyncio.ensure_future(self.gone.wait()), CLOSE_TIMEOUT, 'the tab to close')
+            except TimeoutExceeded as err:
+                debug(f'Closing a camoufox tab: {err}')
         self.detached()
 
 

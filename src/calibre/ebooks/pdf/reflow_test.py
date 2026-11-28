@@ -578,6 +578,25 @@ class TestPageBoundaries(unittest.TestCase):
         self.assertIn(' and self-Contained ', html)
         self.assertNotIn('\x01', html)
 
+    def test_repeated_hyphen_of_a_wrapped_hyphenated_word(self) -> None:
+        # Polish and some other languages repeat the hyphen of a wrapped hyphenated word on the next line
+        page = self.body_lines(150, 3, label='surrounding text ')
+        page += [(337, 300, 1100, f'{self.BODY} and biało-', 0), (337, 335, 1100, f'-czerwony {self.BODY} again.', 0), (337, 370, 500, 'The end.', 0)]
+        page += [(337, 450, 1100, f'{self.BODY} and <i>well-</i>', 0), (337, 485, 1100, f'<i>-known</i> {self.BODY} again.', 0), (337, 520, 500, 'The end.', 0)]
+        html = self.convert([page])
+        self.assertIn(' and biało-czerwony ', html)
+        self.assertIn(' and <i>well-known</i> ', html)
+        self.assertNotIn('--', html)
+        # A name with both parts capitalized is joined, but a line that starts
+        # with a dash before a capital letter is dialogue, so keeps its dash
+        page = self.body_lines(150, 3, label='surrounding text ')
+        page += [(337, 300, 1100, f'{self.BODY} in Bielsko-', 0), (337, 335, 1100, f'-Biała {self.BODY} again.', 0), (337, 370, 500, 'The end.', 0)]
+        page += [(337, 450, 1100, f'{self.BODY} and self-', 0), (337, 485, 1100, f'-Yes {self.BODY} again.', 0), (337, 520, 500, 'The end.', 0)]
+        html = self.convert([page])
+        self.assertIn(' in Bielsko-Biała ', html)
+        self.assertIn('-Yes ', html)
+        self.assertNotIn('self-Yes', html)
+
     def test_split_words_with_unicode_hyphen_and_markup(self) -> None:
         page = self.body_lines(150, 3, label='surrounding text with someunusualword and emailed words ')
         page += self.hyphenated_paragraph(300, 'someunu', 'sualword').copy()
@@ -589,6 +608,47 @@ class TestPageBoundaries(unittest.TestCase):
         self.assertIn(' and emailed ', html)
         self.assertIn(' and <i>some</i>unusualword ', html)
 
+    def test_split_words_in_the_text_of_ocr_programs(self) -> None:
+        # OCR programs, such as ABBYY FineReader, end lines with a soft hyphen, or with spaces after the hyphen
+        page = self.body_lines(150, 3, label='surrounding text with kriaučius in it ')
+        page += [(337, 300, 1100, f'{self.BODY} and per\u00ad', 0), (337, 335, 1100, f'sekiojimai {self.BODY} again.', 0), (337, 370, 500, 'The end.', 0)]
+        page += [(337, 450, 1100, f'{self.BODY} and kriau- ', 0), (337, 485, 1100, f'čius {self.BODY} again.', 0), (337, 520, 500, 'The end.', 0)]
+        page += [(337, 600, 1100, f'{self.BODY} and Valančius- ', 0), (337, 635, 1100, f'Žemaičių {self.BODY} again.', 0), (337, 670, 500, 'The end.', 0)]
+        html = self.convert([page])
+        self.assertIn(' and persekiojimai ', html)
+        self.assertIn(' and kriaučius ', html)
+        self.assertIn(' and Valančius- Žemaičių ', html)
+        self.assertNotIn('\u00ad', html)
+
+    def test_dash_with_space_at_the_end_of_a_line_keeps_the_space(self) -> None:
+        # A hyphen followed by a space at the end of a line, that is not where a word is split, is a dash between words
+        page = self.body_lines(150, 3, label='surrounding text ')
+        page += [(337, 300, 1100, f'{self.BODY} and klaikus- ', 0), (337, 335, 1100, f'šmėklų {self.BODY} again.', 0), (337, 370, 500, 'The end.', 0)]
+        html = self.convert([page])
+        self.assertIn(' and klaikus- šmėklų ', html)
+        self.assertNotIn('\x03', html)
+
+    def test_split_words_with_space_after_the_hyphen_in_markup(self) -> None:
+        # The space after the hyphen can be outside the markup around it
+        page = self.body_lines(150, 3, label='surrounding text with kriaučius in it ')
+        page += [(337, 300, 1100, f'{self.BODY} and <i>kriau-</i> ', 0), (337, 335, 1100, f'<i>čius</i> {self.BODY} again.', 0), (337, 370, 500, 'The end.', 0)]
+        page += [
+            (337, 450, 1100, f'{self.BODY} and <i>per\u00ad</i>', 0),
+            (337, 485, 1100, f'<i>sekiojimai</i> {self.BODY} again.', 0),
+            (337, 520, 500, 'The end.', 0),
+        ]
+        html = self.convert([page])
+        self.assertIn(' and <i>kriaučius</i> ', html)
+        self.assertIn(' and <i>persekiojimai</i> ', html)
+
+    def test_soft_hyphens_inside_words_are_not_word_breaks(self) -> None:
+        # A word with a soft hyphen in the middle of a line is the same word
+        # as one split there over two lines
+        page = self.body_lines(150, 3, label='surrounding text with para\u00adskiepio in it ')
+        page += [(337, 300, 1100, f'{self.BODY} and para- ', 0), (337, 335, 1100, f'skiepio {self.BODY} again.', 0), (337, 370, 500, 'The end.', 0)]
+        html = self.convert([page])
+        self.assertIn(' and paraskiepio ', html)
+
     def test_hyphen_in_overlapping_parts_of_a_line_is_kept(self) -> None:
         # Parts of a line that overlap a little are not a word split over two
         # lines, even if the word without the hyphen is in the document
@@ -596,6 +656,19 @@ class TestPageBoundaries(unittest.TestCase):
         page += [(337, 300, 1000, f'{self.BODY} and an e-', 0), (1335, 300, 100, 'mail here', 0)]
         page += [(337, 335, 1100, f'{self.BODY} again.', 0), (337, 370, 500, 'The end.', 0)]
         self.assertIn('e-mail here', self.convert([page]))
+
+    def test_split_names_with_another_form_in_the_document_are_joined(self) -> None:
+        # A name with another form in the document is joined only at a hyphenation point
+        page = self.body_lines(150, 3, label='surrounding text with the quenzelmores and the zorpblattwoodstockade and the treehouse ')
+        page += self.hyphenated_paragraph(300, 'quen', 'zelmore')
+        page += self.hyphenated_paragraph(450, 'quenz', 'elmore')  # not a hyphenation point
+        page += self.hyphenated_paragraph(600, 'zorpb', 'lattwoodstock')  # only a longer word shares the start
+        page += self.hyphenated_paragraph(750, 'tree', 'houses')  # both parts are dictionary words, a compound
+        html = self.convert([page])
+        self.assertIn(' and quenzelmore ', html)
+        self.assertIn(' and quenz-elmore ', html)
+        self.assertIn(' and zorpb-lattwoodstock ', html)
+        self.assertIn(' and tree-houses ', html)
 
     def test_repeated_table_headings_are_not_running_heads(self) -> None:
         # The headings of the columns of a table that continues over several
@@ -1359,16 +1432,115 @@ class TestPageAnchorsSurviveHeuristics(unittest.TestCase):
         self.assertEqual(ans, '<p>The previous page ends in the middle of a sentence <a id=\'a"b\'></a><i id="x">that</i> continues here.</p>')
 
     def test_dehyphenating_a_word_across_pages(self) -> None:
-        from calibre.ebooks.conversion.preprocess import Dehyphenator
+        from unittest.mock import patch
+
+        import calibre.spell.dictionary as sd
+        from calibre.ebooks.conversion.preprocess import Dehyphenator, SpellingDictionary
         from calibre.utils.logging import default_log
 
+        # Enough distinct words to tell the language of the text from
+        story = (
+            '<p>It was a cold morning in the small village near the river, and the old farmer walked slowly along the narrow road '
+            'towards the market. He carried a heavy basket full of fresh apples, bread, cheese and eggs, which he hoped to sell '
+            'before noon, because his daughter was waiting at home with their young children for the money.</p>\n'
+        )
         html = '<p>The previous page ends in the middle of a hyphen-</p>\n<p id="page_2">ated word and the hyphenated text.</p>'
         ans = Dehyphenator(0, default_log)(html, 'html', 5)
         self.assertEqual(ans, '<p>The previous page ends in the middle of a <a id="page_2"></a>hyphenated word and the hyphenated text.</p>')
-        # The hyphen is kept for words not found elsewhere in the text
+        # A word not found elsewhere in the text is joined if it is in the spelling dictionary
+        html = story + '<p>The previous page ends in the middle of a hyphen-</p>\n<p id="page_2">ated word.</p>'
+        ans = Dehyphenator(0, default_log)(html, 'html', 5)
+        self.assertEqual(ans, story + '<p>The previous page ends in the middle of a <a id="page_2"></a>hyphenated word.</p>')
+        # The hyphen is kept for words neither in the text nor in the dictionary
+        html = story + '<p>The previous page ends in the middle of a zorpb-</p>\n<p id="page_2">latt word.</p>'
+        ans = Dehyphenator(0, default_log)(html, 'html', 5)
+        self.assertEqual(ans, story + '<p>The previous page ends in the middle of a <a id="page_2"></a>zorpb-latt word.</p>')
+        # A text too small to tell the language from does not use a dictionary
         html = '<p>The previous page ends in the middle of a hyphen-</p>\n<p id="page_2">ated word.</p>'
         ans = Dehyphenator(0, default_log)(html, 'html', 5)
         self.assertEqual(ans, '<p>The previous page ends in the middle of a <a id="page_2"></a>hyphen-ated word.</p>')
+
+        # The dictionary is chosen only once for all the passes and files of a conversion
+        with patch.object(sd, 'load_dictionary', wraps=sd.load_dictionary) as load:
+            spelling_dictionary = SpellingDictionary(default_log)
+            for i, word in enumerate(('hyphen-</p>\n<p>ated', 'extra-</p>\n<p>ordinary', 'remark-</p>\n<p>able')):
+                html = story.replace('cold', ('warm', 'wet', 'dry')[i]) + f'<p>A {word} word.</p>'
+                ans = Dehyphenator(0, default_log, spelling_dictionary)(html, 'html', 5)
+                self.assertIn(word.replace('-</p>\n<p>', ''), ans)
+            loads = load.call_count
+            self.assertGreater(loads, 0)
+            Dehyphenator(0, default_log, spelling_dictionary)(story + '<p>A hyphen-</p>\n<p>ated word.</p>', 'html', 5)
+            self.assertEqual(load.call_count, loads)
+
+        # Ties between dictionaries are broken the same way whatever their order
+        class Obj:
+            def __init__(self, words: set[str]) -> None:
+                self.recognized = words.__contains__
+
+        words = {'one', 'two', 'three'}
+        dics = {
+            (lc, cc): sd.Dictionary(sd.DictionaryLocale(lc, cc), frozenset(), f'/{lc}-{cc}.dic', '', True, None, None)
+            for lc, cc in (('eng', 'US'), ('eng', 'GB'), ('fra', 'FR'))
+        }
+        objs = {d.dicpath: Obj(set() if d.primary_locale.langcode == 'fra' else set(words)) for d in dics.values()}
+
+        def loaded(d: sd.Dictionary) -> sd.LoadedDictionary:
+            return sd.LoadedDictionary(d.primary_locale, d.locales, objs[d.dicpath], True, None, None)  # ty: ignore[invalid-argument-type] fake dictionary
+
+        for order in (list(dics.values()), list(reversed(dics.values()))):
+            with (
+                patch.object(sd, 'custom_dictionaries', return_value=frozenset()),
+                patch.object(sd, 'builtin_dictionaries', return_value=order),
+                patch.object(sd, 'load_dictionary', side_effect=loaded),
+            ):
+                d = sd.dictionary_recognizing_words(sorted(words), 0.8, default_log)
+            self.assertIsNotNone(d)
+            assert d is not None
+            self.assertEqual(d.primary_locale, sd.DictionaryLocale('eng', 'GB'))
+            self.assertIs(d.obj, objs['/eng-GB.dic'])
+
+    def test_dehyphenating_a_repeated_hyphen(self) -> None:
+        from calibre.ebooks.conversion.preprocess import Dehyphenator
+        from calibre.utils.logging import default_log
+
+        html = '<p>The flag of Poland is biało-</p>\n<p id="page_2">-czerwona and so is the shield.</p>'
+        ans = Dehyphenator(0, default_log)(html, 'html', 5)
+        self.assertEqual(ans, '<p>The flag of Poland is <a id="page_2"></a>biało-czerwona and so is the shield.</p>')
+        txt = 'The flag of Poland is biało-\n-czerwona and so is the shield.'
+        self.assertEqual(Dehyphenator(0, default_log)(txt, 'txt', 5), 'The flag of Poland is biało-czerwona and so is the shield.')
+        # A new paragraph that starts with a dash, a capital letter or a minus sign does not change
+        for txt in (
+            'The flag of Poland is biało-\n\n-czerwona and so is the shield.',
+            'He said that it was self-\n-Yes, it was.',
+            'The temperature was minus-\n-5 degrees.',
+        ):
+            self.assertEqual(Dehyphenator(0, default_log)(txt, 'txt', 5), txt)
+        html = '<p>The flag of Poland is biało‐</p>\n<p>‐czerwona and so is the shield.</p>'
+        self.assertIn('biało‐czerwona', Dehyphenator(0, default_log)(html, 'html', 5))
+
+        def dehyphenate(text: str, fmt: str) -> str:
+            return Dehyphenator(0, default_log)(text, fmt, 5)
+
+        # Both parts of a name are capitalized
+        self.assertEqual(dehyphenate('He lived in Bielsko-\n-Biała for years.', 'txt'), 'He lived in Bielsko-Biała for years.')
+        self.assertEqual(dehyphenate('<p>He lived in Bielsko-</p>\n<p>-Biała for years.</p>', 'html'), '<p>He lived in Bielsko-Biała for years.</p>')
+        # Empty paragraphs, as left by a page break, are crossed as for other split words
+        html = '<p>The flag of Poland is biało-</p>\n<p></p>\n<p>-czerwona and so is the shield.</p>'
+        self.assertEqual(dehyphenate(html, 'html'), '<p>The flag of Poland is biało-czerwona and so is the shield.</p>')
+        # The other formats
+        html = 'The flag of Poland is biało-<p>-czerwona and so is the shield.'
+        self.assertEqual(dehyphenate(html, 'pdf'), 'The flag of Poland is biało-czerwona and so is the shield.')
+        html = '<p>The flag of Poland is <i>biało-</i><i>-czerwona</i> and so is the shield.</p>'
+        self.assertEqual(dehyphenate(html, 'html_cleanup'), '<p>The flag of Poland is <i>biało-czerwona</i> and so is the shield.</p>')
+        self.assertEqual(dehyphenate('The flag is biało- -czerwona.', 'txt_cleanup'), 'The flag is biało-czerwona.')
+        # The items of a list that starts with hyphens are not joined to the line before
+        for text, fmt in (
+            ('Things to buy at the shop-\n-apples\n-pears', 'txt'),
+            ('<p>Things to buy at the shop-</p>\n<p>-apples</p>\n<p>-pears</p>', 'html'),
+        ):
+            self.assertEqual(dehyphenate(text, fmt), text)
+        # But a hyphenated word with three parts is
+        self.assertEqual(dehyphenate('The colours are biało-\n-czerwono-\n-zielone here.', 'txt'), 'The colours are biało-czerwono-\n-zielone here.')
 
     def test_restyled_heading(self) -> None:
         html = '<p>Text.</p>\n<p> </p>\n<h2 id="page_3" style="text-align:right">A heading</h2>\n<p> </p>\n<p>More text.</p>'

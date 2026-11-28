@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
+import logging
 import operator
 from collections import OrderedDict
 from functools import partial
 from typing import TYPE_CHECKING
 
-from css_parser.css import CSSRule, Property
+from kgcss import DeclarationBlock, Property, RuleType, Stylesheet, longhands, parse_style, parse_stylesheet
 
-from calibre import force_unicode
 from calibre.ebooks import parse_css_length
-from calibre.ebooks.oeb.normalize_css import normalizers, safe_parser
+from calibre.ebooks.oeb.normalize_css import normalize_shorthand
 from calibre.utils.localization import _
 
 if TYPE_CHECKING:
@@ -18,11 +18,14 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 
     import regex
-    from css_parser.css import CSSStyleDeclaration, CSSStyleSheet
 
     from calibre.ebooks.oeb.polish.container import Container
 
     type SerializedRule = Mapping[str, str]
+
+
+#: Problems are logged with the other CSS problems, in the conversion log during conversions
+css_log = logging.getLogger('calibre.css')
 
 
 def compile_pat(pat: str) -> regex.Pattern:  # ty: ignore[invalid-type-form]
@@ -32,56 +35,40 @@ def compile_pat(pat: str) -> regex.Pattern:  # ty: ignore[invalid-type-form]
     return regex.compile(pat, flags=REGEX_FLAGS)
 
 
-def all_properties(decl: CSSStyleDeclaration) -> Iterator[Property]:
-    "This is needed because CSSStyleDeclaration.getProperties(None, all=True) does not work and is slower than it needs to be."
-    for item in decl.seq:
-        p = item.value
+def all_properties(decl: DeclarationBlock) -> Iterator[Property]:
+    "Every declaration, including the ones that later declarations override"
+    for p in decl.items:
         if isinstance(p, Property):
             yield p
 
 
 class StyleDeclaration:
-    def __init__(self, css_declaration: CSSStyleDeclaration) -> None:
+    def __init__(self, css_declaration: DeclarationBlock) -> None:
         self.css_declaration = css_declaration
         self.expanded_properties: dict[Property, list[Property]] = {}
         self.changed = False
 
     def __iter__(self) -> Iterator[tuple[Property, Property | None]]:
-        dec = self.css_declaration
-        for p in all_properties(dec):
-            n = normalizers.get(p.name)
-            if n is None:
-                yield p, None
-            else:
-                if p not in self.expanded_properties:
-                    self.expanded_properties[p] = [Property(k, v, p.literalpriority) for k, v in n(p.name, p.propertyValue).items()]
-                for ep in self.expanded_properties[p]:
-                    yield ep, p
+        for p in tuple(all_properties(self.css_declaration)):
+            props = self.expanded_properties.get(p)
+            if props is None:
+                expanded = normalize_shorthand(p.name, p.value_to_css())
+                if expanded is None:
+                    yield p, None
+                    continue
+                props = self.expanded_properties[p] = [Property(k, v, p.priority) for k, v in expanded.items()]
+            for ep in props:
+                yield ep, p
 
     def expand_property(self, parent_prop: Property) -> None:
         props = self.expanded_properties.pop(parent_prop, None)
-        if props is None:
-            return
-        dec = self.css_declaration
-        seq = dec._tempSeq()
-        for item in dec.seq:
-            if item.value is parent_prop:
-                for c in sorted(props, key=operator.attrgetter('name')):
-                    c.parent = dec
-                    seq.append(c, 'Property')
-            else:
-                seq.appendItem(item)
-        dec._setSeq(seq)
+        if props is not None:
+            self.css_declaration.replace_declaration(parent_prop, sorted(props, key=operator.attrgetter('name')))
 
     def remove_property(self, prop: Property, parent_prop: Property | None) -> None:
         if parent_prop is not None:
             self.expand_property(parent_prop)
-        dec = self.css_declaration
-        seq = dec._tempSeq()
-        for item in dec.seq:
-            if item.value is not prop:
-                seq.appendItem(item)
-        dec._setSeq(seq)
+        self.css_declaration.remove_declaration(prop)
         self.changed = True
 
     def change_property(
@@ -91,30 +78,36 @@ class StyleDeclaration:
         val: str,
         match_pat: regex.Pattern | None = None,  # ty: ignore[invalid-type-form]
     ) -> None:
+        nval = val if match_pat is None else match_pat.sub(val, prop.value_to_css())
+        try:
+            # Check the value before changing anything
+            Property(prop.name, nval)
+        except ValueError as err:
+            # A value that would break the CSS around it, such as one with
+            # a semi-colon, leave the property as it is
+            css_log.warning(f'Not changing the CSS property {prop.name} to {nval!r}, it is not valid: {err}')
+            return
         if parent_prop is not None:
             self.expand_property(parent_prop)
-        if match_pat is None:
-            prop.value = val
-        else:
-            prop.value = match_pat.sub(val, prop.value)
+        prop.value = nval
         self.changed = True
 
     def append_properties(self, props: list[Property]) -> None:
         if props:
             self.changed = True
             for prop in props:
-                self.css_declaration.setProperty(Property(prop.name, prop.value, prop.literalpriority, parent=self.css_declaration))
+                self.css_declaration.set(prop.name, prop.value, prop.priority)
 
     def set_property(self, name: str, value: str, priority: str = '', replace: bool = True) -> None:
         # Note that this does not handle shorthand properties, so you must
         # call remove_property() yourself in that case
         self.changed = True
         if replace:
-            self.css_declaration.removeProperty(name)
-        self.css_declaration.setProperty(Property(name, value, priority, parent=self.css_declaration))
+            self.css_declaration.remove(name)
+        self.css_declaration.set(name, value, priority)
 
     def __str__(self) -> str:
-        return force_unicode(self.css_declaration.cssText, 'utf-8')
+        return self.css_declaration.css_text
 
 
 operator_map = {
@@ -197,8 +190,7 @@ class Rule:
         self.action, self.action_data = action, action_data
         self.match_pat = None
         if self.action == 'append':
-            decl = safe_parser().parseStyle(self.action_data)
-            self.appended_properties = list(all_properties(decl))
+            self.appended_properties = list(all_properties(parse_style(self.action_data)))
         elif self.action in '+-/*':
             self.action_operator = partial(transform_number, float(self.action_data), getattr(operator, operator_map[self.action]))
         if match_type == 'is':
@@ -224,7 +216,8 @@ class Rule:
     def process_declaration(self, declaration: StyleDeclaration) -> bool:
         oval, declaration.changed = declaration.changed, False
         for prop, parent_prop in tuple(declaration):
-            if prop.name == self.property_name and self.property_matches(prop.value):
+            # Values are matched normalized, as css_parser gave them before kgcss
+            if prop.name == self.property_name and self.property_matches(prop.value_to_css()):
                 if self.action == 'remove':
                     declaration.remove_property(prop, parent_prop)
                 elif self.action == 'change':
@@ -232,7 +225,7 @@ class Rule:
                 elif self.action == 'append':
                     declaration.append_properties(self.appended_properties)
                 else:
-                    val = prop.value
+                    val = prop.value_to_css()
                     nval = self.action_operator(val)
                     if val != nval:
                         declaration.change_property(prop, parent_prop, nval)
@@ -279,7 +272,7 @@ def validate_rule(rule: SerializedRule) -> tuple[str, str] | tuple[None, None]:
     mt = rule['match_type']
     if not rule['property']:
         return _('Property required'), _('You must specify a CSS property to match')
-    if rule['property'] in normalizers:
+    if longhands(rule['property']):
         return _('Shorthand property not allowed'), _(
             '{0} is a shorthand property. Use the full form of the property,'
             ' for example, instead of font, use font-family, instead of margin, use margin-top, etc.'
@@ -322,7 +315,7 @@ def compile_rules(serialized_rules: Iterable[SerializedRule]) -> list[Rule]:
     return [Rule(**r) for r in serialized_rules]
 
 
-def transform_declaration(compiled_rules: Iterable[Rule], decl: CSSStyleDeclaration) -> bool:
+def transform_declaration(compiled_rules: Iterable[Rule], decl: DeclarationBlock) -> bool:
     sdecl = StyleDeclaration(decl)
     changed = False
     for rule in compiled_rules:
@@ -331,9 +324,9 @@ def transform_declaration(compiled_rules: Iterable[Rule], decl: CSSStyleDeclarat
     return changed
 
 
-def transform_sheet(compiled_rules: Iterable[Rule], sheet: CSSStyleSheet) -> bool:
+def transform_sheet(compiled_rules: Iterable[Rule], sheet: Stylesheet) -> bool:
     changed = False
-    for rule in sheet.cssRules.rulesOfType(CSSRule.STYLE_RULE):
+    for rule in sheet.iter_rules(RuleType.STYLE):
         if transform_declaration(compiled_rules, rule.style):
             changed = True
     return changed
@@ -406,7 +399,7 @@ def test(return_tests: bool = False) -> unittest.TestSuite | None:  # {{{
 
     def apply_rule(style: str, **rule: str) -> str:
         r = Rule(**rule)
-        decl = StyleDeclaration(safe_parser().parseStyle(style))
+        decl = StyleDeclaration(parse_style(style))
         r.process_declaration(decl)
         return str(decl).rstrip(';')
 
@@ -439,6 +432,9 @@ def test(return_tests: bool = False) -> unittest.TestSuite | None:  # {{{
             m('is', 'blue')
             css, ecss = 'color: currentColor; line-height: 0', 'line-height: 0'
             m('is', 'currentColor')
+            # Values are matched normalized
+            css, ecss = 'color: #FF0000; line-height: 0', 'line-height: 0'
+            m('is', '#f00')
 
             prop = 'margin-top'
             css, ecss = 'color: red; margin-top: 10', 'color: red'
@@ -469,10 +465,13 @@ def test(return_tests: bool = False) -> unittest.TestSuite | None:  # {{{
             )
             m('margin: 0', 'margin-bottom: 0;\nmargin-left: 0;\nmargin-right: 0;\nmargin-top: 1pt', 'change', '1pt')
             prop = 'font-family'
+            # The font shorthand also sets font-stretch (porting.md §6.9)
             m(
                 'font: 10em "Kovid Goyal", monospace',
-                'font-size: 10em;\nfont-style: normal;\nfont-variant: normal;\nfont-weight: normal;\nline-height: normal',
+                'font-size: 10em;\nfont-stretch: normal;\nfont-style: normal;\nfont-variant: normal;\nfont-weight: normal;\nline-height: normal',
             )
+            # Invalid shorthands are not expanded (porting.md §6.9)
+            m('font: Kovid; color: red', 'font: Kovid;\ncolor: red')
 
         def test_append(self) -> None:
             def m(css: str, ecss: str, action_data: str = '') -> None:
@@ -500,6 +499,22 @@ def test(return_tests: bool = False) -> unittest.TestSuite | None:  # {{{
                 '3',
             )
             prop = 'font-size'
+            # A change that would make a value that breaks the CSS is not made
+            prop = 'color'
+            m('color: red; margin: 0', 'color: red;\nmargin: 0', action_data='blue; } x { y: z')
+
+        def test_sheet(self) -> None:
+            sheet = parse_stylesheet('a { color: red } @media screen { @supports (x: y) { b { color: red; margin: 0 } } } c { margin: 0 }')
+            rules = compile_rules([{'property': 'color', 'match_type': 'is', 'query': 'RED', 'action': 'change', 'action_data': 'blue'}])
+            # Style rules at any depth
+            self.assertTrue(transform_sheet(rules, sheet))
+            self.ae(
+                sheet.css_text,
+                'a {\n  color: blue;\n}\n'
+                '@media screen {\n  @supports (x: y) {\n    b {\n      color: blue;\n      margin: 0;\n    }\n  }\n}\n'
+                'c {\n  margin: 0;\n}',
+            )
+            self.assertFalse(transform_sheet(rules, sheet))
 
         def test_export_import(self) -> None:
             rule = {

@@ -492,10 +492,10 @@ class EPUBOutput(OutputFormatPlugin):
         Perform various markup transforms to get the output to render correctly
         in the quirky ADE.
         """
-        from css_parser.css import CSSStyleSheet
+        from kgcss import RuleType, Stylesheet
         from lxml import etree
 
-        from calibre.ebooks.oeb.base import XHTML, XPath, barename, urlunquote
+        from calibre.ebooks.oeb.base import XHTML, XPath, barename, single_class_name, urlunquote
 
         stylesheet = self.oeb.manifest.main_stylesheet
         # ADE cries big wet tears when it encounters an invalid fragment
@@ -610,25 +610,22 @@ class EPUBOutput(OutputFormatPlugin):
 
             if stylesheet is not None:
                 # ADE doesn't render lists correctly if they have left margins
-                from css_parser.css import CSSRule
-
                 sheet = stylesheet.data
-                assert isinstance(sheet, CSSStyleSheet)
+                assert isinstance(sheet, Stylesheet)  # main_stylesheet has a media type in OEB_STYLES
 
                 for lb in XPath('//h:ul[@class]|//h:ol[@class]')(root):
-                    sel = '.' + lb.get('class')
-                    for rule in sheet.cssRules.rulesOfType(CSSRule.STYLE_RULE):
-                        if sel == rule.selectorList.selectorText:
-                            rule.style.removeProperty('margin-left')
+                    cls = lb.get('class')
+                    for rule in sheet.rules.of_type(RuleType.STYLE):
+                        if len(rule.selectors) == 1 and single_class_name(rule.selectors[0]) == cls:
+                            rule.style.remove('margin-left')
                             # padding-left breaks rendering in webkit and gecko
-                            rule.style.removeProperty('padding-left')
+                            rule.style.remove('padding-left')
                 # Change whitespace:pre to pre-wrap to accommodate readers that
                 # cannot scroll horizontally
-                for rule in sheet.cssRules.rulesOfType(CSSRule.STYLE_RULE):
+                for rule in sheet.rules.of_type(RuleType.STYLE):
                     style = rule.style
-                    ws = style.getPropertyValue('white-space')
-                    if ws == 'pre':
-                        style.setProperty('white-space', 'pre-wrap')
+                    if style.get_value('white-space') == 'pre':
+                        style.set('white-space', 'pre-wrap')
 
     # }}}
 

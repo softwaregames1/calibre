@@ -2,6 +2,7 @@
 # License: GPLv3 Copyright: 2013, Kovid Goyal <kovid at kovidgoyal.net>
 
 import os
+import re
 import shutil
 import sys
 from typing import IO, TYPE_CHECKING, cast
@@ -10,7 +11,7 @@ from lxml import etree
 
 from calibre import guess_type, walk
 from calibre.ebooks.docx import InvalidDOCX
-from calibre.ebooks.docx.names import DOCXNamespace
+from calibre.ebooks.docx.names import KEYWORD_SEPARATORS, DOCXNamespace
 from calibre.ebooks.metadata import authors_to_sort_string, string_to_authors
 from calibre.ebooks.metadata.book.base import Metadata
 from calibre.ptempfile import PersistentTemporaryDirectory
@@ -37,6 +38,9 @@ def fromstring(raw: str | bytes, parser: object = None) -> etree._Element:
 # Read metadata {{{
 
 
+keyword_separators_pat = re.compile(f'[{re.escape(KEYWORD_SEPARATORS)}]')
+
+
 def read_doc_props(raw: str | bytes, mi: Metadata, XPath: Callable[[str], etree.XPath]) -> None:
     root = fromstring(raw)
     titles = XPath('//dc:title')(root)
@@ -46,12 +50,14 @@ def read_doc_props(raw: str | bytes, mi: Metadata, XPath: Callable[[str], etree.
             mi.title = title.strip()
     tags = []
     for subject in XPath('//dc:subject')(root):
+        # The subject is a single value, not a list, so it is not split
         if subject.text and subject.text.strip():
             tags.append(subject.text.strip().replace(',', '_'))
     for keywords in XPath('//cp:keywords')(root):
         if keywords.text and keywords.text.strip():
-            for x in keywords.text.split():
-                tags.extend(y.strip() for y in x.split(',') if y.strip())
+            # Keywords can contain spaces, so do not split on whitespace. A
+            # single keyword such as "Science fiction" has no separator at all.
+            tags.extend(x.strip() for x in keyword_separators_pat.split(keywords.text) if x.strip())
     if tags:
         mi.tags = tags
     authors = XPath('//dc:creator')(root)
@@ -226,18 +232,16 @@ class DOCX:
         return by_id, by_type
 
     def get_document_properties_names(self) -> Iterator[str | None]:
-        name = self.relationships.get(self.namespace.names['DOCPROPS'], None)
-        if name is None:
-            names = tuple(n for n in self.names if n.lower() == 'docprops/core.xml')
-            if names:
-                name = names[0]
-        yield name
-        name = self.relationships.get(self.namespace.names['APPPROPS'], None)
-        if name is None:
-            names = tuple(n for n in self.names if n.lower() == 'docprops/app.xml')
-            if names:
-                name = names[0]
-        yield name
+        for rtype, default in (('DOCPROPS', 'docprops/core.xml'), ('APPPROPS', 'docprops/app.xml')):
+            name = self.relationships.get(self.namespace.names[rtype], None)
+            if name is not None and not self.exists(name):
+                # OPC part names are case-insensitive, so the relationship
+                # target may differ in case from the name in the ZIP file
+                q = name.lower()
+                name = next((n for n in self.names if n.lower() == q), name)
+            if name is None:
+                name = next((n for n in self.names if n.lower() == default), None)
+            yield name
 
     @property
     def metadata(self) -> Metadata:

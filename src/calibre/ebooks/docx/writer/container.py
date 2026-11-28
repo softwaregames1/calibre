@@ -10,7 +10,7 @@ from lxml.builder import ElementMaker
 
 from calibre import guess_type
 from calibre.constants import __appname__, numeric_version
-from calibre.ebooks.docx.names import DOCXNamespace
+from calibre.ebooks.docx.names import KEYWORD_SEPARATORS, DOCXNamespace
 from calibre.ebooks.metadata import authors_to_string
 from calibre.ebooks.pdf.render.common import PAPER_SIZES
 from calibre.utils.date import utcnow
@@ -104,6 +104,9 @@ def create_skeleton(opts: Values | OptionValues, namespaces: dict[str, str] | No
     return doc, styles, body
 
 
+keyword_separators_table = str.maketrans(dict.fromkeys(KEYWORD_SEPARATORS, '_'))
+
+
 def update_doc_props(root: etree._Element, mi: Metadata, namespace: DOCXNamespace) -> None:
     def setm(name: str, text: str | None = None, ns: str = 'dc') -> etree._Element:
         ans = root.makeelement(f'{{{namespace.namespaces[ns]}}}{name}')
@@ -117,7 +120,8 @@ def update_doc_props(root: etree._Element, mi: Metadata, namespace: DOCXNamespac
     setm('title', mi.title)
     setm('creator', authors_to_string(mi.authors))
     if mi.tags:
-        setm('keywords', ', '.join(mi.tags), ns='cp')
+        # Replace separators inside tags so that each tag is read back whole
+        setm('keywords', ', '.join(t.translate(keyword_separators_table) for t in mi.tags), ns='cp')
     if mi.comments:
         setm('description', mi.comments)
     if mi.languages:
@@ -150,11 +154,13 @@ class DocumentRelationships:
     def add_image(self, target: str) -> str:
         return self.add_relationship(target, self.namespace.names['IMAGES'])
 
-    def serialize(self) -> bytes:
+    def serialize(self, only_types: frozenset[str] | None = None) -> bytes:
         namespaces = self.namespace.namespaces
         E = ElementMaker(namespace=namespaces['pr'], nsmap={None: namespaces['pr']})
         relationships = E.Relationships()
         for (target, rtype, target_mode), rid in self.rmap.items():
+            if only_types is not None and rtype not in only_types:
+                continue
             r = E.Relationship(Id=rid, Type=rtype, Target=target)
             if target_mode is not None:
                 r.set('TargetMode', target_mode)
@@ -174,6 +180,8 @@ class DOCX:
         self.embedded_fonts = E.Relationships()
         self.fonts: dict[str, bytes] = {}
         self.images: dict[str, Callable[[], bytes | str]] = {}
+        # The footnotes or endnotes part, as (name, root), for example: ('footnotes', <w:footnotes>)
+        self.notes: tuple[str, etree._Element] | None = None
 
     # Boilerplate {{{
     @property
@@ -282,6 +290,13 @@ class DOCX:
             zf.writestr('word/fontTable.xml', xml2str(self.font_table))
             zf.writestr('word/_rels/document.xml.rels', self.document_relationships.serialize())
             zf.writestr('word/_rels/fontTable.xml.rels', xml2str(self.embedded_fonts))
+            if self.notes is not None:
+                name, root = self.notes
+                zf.writestr(f'word/{name}.xml', xml2str(root))
+                # The notes part is in the same folder as the document so it
+                # can use the same relationships for hyperlinks and images.
+                names = self.namespace.names
+                zf.writestr(f'word/_rels/{name}.xml.rels', self.document_relationships.serialize(frozenset((names['LINKS'], names['IMAGES']))))
             for fname, data_getter in self.images.items():
                 zf.writestr(fname, data_getter())
             for fname, data in self.fonts.items():

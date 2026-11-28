@@ -28,18 +28,18 @@ if TYPE_CHECKING:
     from datetime import datetime, timedelta
     from typing import IO
 
+    from _typeshed import SupportsWrite
     from qt.core import QImage, QPixmap
 
+    from calibre.db.adding import CompiledRules, Duplicates
     from calibre.db.backend import CustomColumnData
     from calibre.db.cache import FormatMetadataDict
     from calibre.db.categories import Tag
     from calibre.db.view import TableRow
-    from calibre.ebooks.metadata.book.base import Metadata
+    from calibre.ebooks.metadata.book.base import FieldMetadataDict, Metadata
     from calibre.library.field_metadata import FieldMetadata
     from calibre.utils.filenames import WindowsAtomicFolderMove
 
-    type CompiledRules = Iterable[tuple[Callable[[str], bool], bool]]
-    type Duplicates = list[tuple[Metadata, list[str]]]
     type Listener = Callable[[str, Iterable[int]], object]
     type BookOnDeviceFunc = Callable[[int], Sequence[object] | None]
 
@@ -253,6 +253,10 @@ class LibraryDatabase:
     # These attributes are assigned dynamically at module level after class definition
     multisort: Callable[..., None]
     all_custom: Callable[..., frozenset[str]]
+    all_author_names: Callable[..., frozenset[str]]
+    all_tag_names: Callable[..., frozenset[str]]
+    all_publisher_names: Callable[..., frozenset[str]]
+    all_series_names: Callable[..., frozenset[str]]
     format_hash: Callable[..., str]
     index: Callable[..., int]
     has_cover: Callable[..., bool]
@@ -270,7 +274,7 @@ class LibraryDatabase:
     get_all_identifier_types: Callable[..., list[str]]
     get_authors_with_ids: Callable[..., list[list[int | str]]]
     get_author_id: Callable[..., int | None]
-    metadata_for_field: Callable[..., dict[str, object] | None]
+    metadata_for_field: Callable[..., FieldMetadataDict | None]
     saved_search_names: Callable[..., list[str]]
     saved_search_lookup: Callable[..., str | None]
     saved_search_set_all: Callable[..., None]
@@ -283,8 +287,38 @@ class LibraryDatabase:
     clean_custom: Callable[..., None]
     clean_standard_field: Callable[..., None]
     commit: Callable[..., None]
+    title: Callable[..., str]
+    custom_field_keys: Callable[..., list[str]]
+    authors: Callable[..., str]
+    all_authors: Callable[..., list[tuple[int, str]]]
+    publisher: Callable[..., str | None]
+    series: Callable[..., str | None]
+    rating: Callable[..., int | None]
+    languages: Callable[..., str | None]
+    set_rating: Callable[..., builtins.set[int] | bool | None]
+    set_series: Callable[..., builtins.set[int]]
+    set_series_index: Callable[..., builtins.set[int] | bool | None]
+    set_timestamp: Callable[..., builtins.set[int] | bool | None]
+    set_pubdate: Callable[..., builtins.set[int] | bool | None]
+    set_languages: Callable[..., builtins.set[int] | bool | None]
+    get_next_series_num_for: Callable[..., float]
+    author_sort: Callable[..., str]
+    series_index: Callable[..., float]
+    comments: Callable[..., str | None]
+    tags: Callable[..., str | None]
+    ondevice: Callable[..., str | None]
+    metadata_last_modified: Callable[..., datetime | None]
+    set_authors: Callable[..., builtins.set[int]]
+    set_publisher: Callable[..., builtins.set[int]]
+    set_author_sort: Callable[..., builtins.set[int] | bool | None]
+    set_comment: Callable[..., builtins.set[int] | bool | None]
+    set_identifiers: Callable[..., builtins.set[int] | bool | None]
+    set_has_cover: Callable[..., None]
     # Assigned dynamically in __init__ from self.data
     get_property: Callable[..., object]
+    count: Callable[..., int]
+    refresh_ids: Callable[..., list[int] | None]
+    search: Callable[..., list[int] | None]
     # Assigned by calibre.gui2.convert.gui_conversion.gui_catalog() for use by catalog plugins
     catalog_plugin_on_device_temp_mapping: dict[int, dict[str, str | None]]
 
@@ -662,6 +696,14 @@ class LibraryDatabase:
         book_id = index if index_is_id else self.id(index)
         return self.new_api.cover_last_modified(book_id) or self.last_modified()
 
+    @overload
+    def cover(
+        self, index: int, index_is_id: bool = False, as_file: Literal[False] = False, as_image: Literal[False] = False, as_path: Literal[False] = False
+    ) -> bytes | None: ...
+    @overload
+    def cover(
+        self, index: int, index_is_id: bool = False, as_file: bool = False, as_image: bool = False, as_path: bool = False
+    ) -> bytes | IO[bytes] | QImage | QPixmap | str | None: ...
     def cover(
         self, index: int, index_is_id: bool = False, as_file: bool = False, as_image: bool = False, as_path: bool = False
     ) -> bytes | IO[bytes] | QImage | QPixmap | str | None:
@@ -683,7 +725,7 @@ class LibraryDatabase:
         self,
         index: int,
         fmt: str,
-        dest: str | IO[bytes],
+        dest: str | SupportsWrite[bytes],
         index_is_id: bool = False,
         windows_atomic_move: WindowsAtomicFolderMove | None = None,
         use_hardlink: bool = False,
@@ -922,6 +964,33 @@ class LibraryDatabase:
     def has_id(self, book_id: int) -> bool:
         return self.new_api.has_id(book_id)
 
+    @overload
+    def format(
+        self, index: int, fmt: str, index_is_id: bool = False, *, as_file: Literal[True], mode: str = 'r+b', preserve_filename: bool = False
+    ) -> IO[bytes] | None: ...
+    @overload
+    def format(
+        self,
+        index: int,
+        fmt: str,
+        index_is_id: bool = False,
+        as_file: Literal[False] = False,
+        mode: str = 'r+b',
+        *,
+        as_path: Literal[True],
+        preserve_filename: bool = False,
+    ) -> str | None: ...
+    @overload
+    def format(
+        self,
+        index: int,
+        fmt: str,
+        index_is_id: bool = False,
+        as_file: bool = False,
+        mode: str = 'r+b',
+        as_path: bool = False,
+        preserve_filename: bool = False,
+    ) -> bytes | IO[bytes] | str | None: ...
     def format(
         self,
         index: int,
@@ -1087,7 +1156,7 @@ class LibraryDatabase:
         num: int | None = None,
         append: bool = False,
         notify: bool = True,
-        extras: Sequence[float] | None = None,
+        extras: Sequence[float | None] | None = None,
     ) -> builtins.set[int] | None:
         if extras is not None and len(extras) != len(ids):
             raise ValueError('Length of ids and extras is not the same')

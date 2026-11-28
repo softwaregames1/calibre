@@ -59,6 +59,31 @@ class PluginInstallationType(enum.IntEnum):
     BUILTIN = 3
 
 
+# Stored in the environment rather than a module global so that worker
+# processes (conversion, adding books, metadata download, etc.) inherit it.
+IGNORE_CUSTOM_PLUGINS_ENV_VAR = 'CALIBRE_IGNORE_CUSTOM_PLUGINS'
+
+
+def ignore_custom_plugins() -> bool:
+    """
+    True if non-builtin (user and system installed) plugins must not be
+    loaded in this process and its child processes.
+    """
+    return os.environ.get(IGNORE_CUSTOM_PLUGINS_ENV_VAR) == '1'
+
+
+def set_ignore_custom_plugins(ignore: bool = True) -> None:
+    """
+    Must be called before :mod:`calibre.customize.ui` is first imported to
+    have any effect on the current process, as that is when plugins are
+    loaded. Child processes launched after this call are always affected.
+    """
+    if ignore:
+        os.environ[IGNORE_CUSTOM_PLUGINS_ENV_VAR] = '1'
+    else:
+        os.environ.pop(IGNORE_CUSTOM_PLUGINS_ENV_VAR, None)
+
+
 class Plugin:  # {{{
     """
     A calibre plugin. Useful members include:
@@ -730,6 +755,8 @@ class InterfaceActionBase(Plugin):  # {{{
 
     #: Import path of the actual interface action class as module:class
     actual_plugin: str | None = None
+    # Set by the GUI once the actual plugin has been loaded
+    actual_iaction_plugin_loaded: bool
 
     def __init__(self, plugin_path: str | None) -> None:
         Plugin.__init__(self, plugin_path)
@@ -824,6 +851,8 @@ class StoreBase(Plugin):  # {{{
 
     #: Import path of the actual store plugin class as module:class
     actual_plugin: str | None = None
+    # Set by the GUI once the actual plugin has been loaded
+    actual_istore_plugin_loaded: bool
 
     # Does the store only distribute e-books without DRM.
     drm_free_only = False

@@ -141,6 +141,49 @@ class POT(Command):  # {{{
 
         return '\n'.join(ans)
 
+    def get_kgcss_strings(self, existing_pot: str) -> str:
+        "The message templates and rule descriptions of the CSS linter in kgcss, shown by Check book"
+        from kgcss import LINT_RULES, SYNTAX_PROBLEM_TEMPLATES, SyntaxProblemKind
+
+        sources: dict[str, list[str]] = {}
+        for info in LINT_RULES.values():
+            for template in info.messages:
+                sources.setdefault(template, []).append(info.rule.value)
+        for kind in SyntaxProblemKind:
+            sources.setdefault(SYNTAX_PROBLEM_TEMPLATES[kind], []).append('CssSyntaxError')
+        descriptions: dict[str, list[str]] = {}
+        for info in LINT_RULES.values():
+            descriptions.setdefault(info.description, []).append(info.rule.value)
+
+        def escape(text: str) -> str:
+            if '\n' in text:
+                raise SystemExit(f'Multi-line kgcss strings are not supported: {text!r}')
+            return text.replace('\\', r'\\').replace('"', r'\"')
+
+        ans = []
+        for template, rules in sources.items():
+            msgid = f'msgid "{escape(template)}"'
+            if f'\n{msgid}\n' in existing_pot:
+                continue  # xgettext found it in the calibre sources already
+            ans.append(
+                f'#. NOTE: A problem found in CSS by Check book, by the rules: {", ".join(rules)}.'
+                ' The placeholders in braces are CSS names or values, keep them untranslated.\n'
+                '#: src/calibre/ebooks/oeb/polish/check/css.py\n'
+            )
+            if '{' in template:
+                ans.append('#, python-brace-format\n')
+            ans.append(f'{msgid}\nmsgstr ""\n\n')
+        for description, rules in descriptions.items():
+            msgid = f'msgid "{escape(description)}"'
+            if f'\n{msgid}\n' in existing_pot or description in sources:
+                continue
+            ans.append(
+                f'#. NOTE: The description of the CSS rules: {", ".join(rules)} used by Check book.\n'
+                '#: src/calibre/ebooks/oeb/polish/check/css.py\n'
+                f'{msgid}\nmsgstr ""\n\n'
+            )
+        return ''.join(ans)
+
     def get_content_server_strings(self):
         self.info('Generating translation template for content_server')
         from calibre import walk
@@ -285,6 +328,7 @@ class POT(Command):  # {{{
             src = pot_header + '\n' + src
             src += '\n\n' + self.get_tweaks_docs()
             src += '\n\n' + self.get_ffml_docs()
+            src += '\n\n' + self.get_kgcss_strings(src)
             bdir = os.path.join(self.TRANSLATIONS, __appname__)
             if not os.path.exists(bdir):
                 os.makedirs(bdir)

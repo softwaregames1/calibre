@@ -23,6 +23,9 @@ class BaseJob:
     RUNNING = 1
     FINISHED = 2
 
+    # Set dynamically by the jobs GUI, use getattr() to read it
+    hidden_in_gui: bool
+
     def __init__(self, description: str, done: Callable[[BaseJob], object] = lambda x: x) -> None:
         self.id = next(job_counter)
         self.description = description
@@ -168,6 +171,14 @@ class BaseJob:
 
 
 class ParallelJob(BaseJob):
+    # Set dynamically by the catalog and convert GUI actions
+    catalog_file_path: str
+    catalog_sync: bool
+    catalog_title: str
+    fmt: str
+    conversion_of_same_fmt: bool
+    manually_fine_tune_toc: bool
+
     def __init__(
         self,
         name: str,

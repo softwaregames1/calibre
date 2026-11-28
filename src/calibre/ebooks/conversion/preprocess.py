@@ -199,17 +199,92 @@ class DocAnalysis:
             return True
 
 
+class SpellingDictionary:
+    """
+    The spelling dictionary for the language of a document, used by the
+    Dehyphenator for words that appear nowhere else in the document. As the
+    language is usually not known, it is the dictionary that recognizes most
+    of the frequent words of the document. It is chosen only once, from the
+    first text that has enough distinct words, so share one instance between
+    all the dehyphenation passes and files of a conversion, as choosing loads
+    every dictionary, and the same dictionary is then used everywhere.
+    """
+
+    # The number of the most frequent words of the text that are looked up
+    SAMPLE_WORDS = 500
+    # Texts with fewer distinct words, such as a title page, are too small to
+    # tell the language from
+    MIN_SAMPLE_WORDS = 50
+    # The fraction of the sample a dictionary must recognize
+    MIN_RECOGNIZED = 0.8
+
+    def __init__(self, log: Log | None = None) -> None:
+        from calibre.utils.logging import default_log
+
+        self.log = default_log if log is None else log
+        self.searched = False
+        self.recognized: Callable[[str], bool] | None = None
+
+    def __call__(self, text: str, is_markup: bool) -> Callable[[str], bool] | None:
+        if not self.searched:
+            sample = self.sample(text, is_markup)
+            if len(sample) < self.MIN_SAMPLE_WORDS:
+                return None
+            self.searched = True
+            from calibre.spell.dictionary import dictionary_recognizing_words
+
+            if (d := dictionary_recognizing_words(sample, self.MIN_RECOGNIZED, self.log)) is not None:
+                self.recognized = d.obj.recognized
+        return self.recognized
+
+    def sample(self, text: str, is_markup: bool) -> list[str]:
+        if is_markup:
+            text = re.sub(r'(?is)<(head|style|script)\b.*?</\1\s*>', ' ', text)
+            text = re.sub(r'&#?\w+;', ' ', re.sub(r'<[^>]*>', ' ', text))
+        counts: dict[str, int] = {}
+        for w in re.findall(r'\w+', text):
+            if w.isalpha():
+                w = w.lower()
+                counts[w] = counts.get(w, 0) + 1
+        return sorted(counts, key=lambda w: (-counts[w], w))[: self.SAMPLE_WORDS]
+
+
+# Text that continues the line after a word, up to the start of the next line
+# when that line starts with a hyphen before a letter, as in a list, in plain
+# text and in markup
+TXT_NEXT_LINE_STARTS_WITH_HYPHEN = re.compile(r'([^\n]*)\n[ \t]*[-‐](?=[^\W\d_])')
+HTML_NEXT_LINE_STARTS_WITH_HYPHEN = re.compile(
+    r'((?:[^<]|<(?!/?(?:p|div)\b))*)(?:</(?:p|div)>\s*)?<(?:p|div)\b[^>]*>\s*(?:<[^>]*>\s*)*[-‐](?=[^\W\d_])', re.IGNORECASE
+)
+LINE_END_HYPHEN = re.compile(r'[^\W\d_][-‐]$')
+
+
+def repeated_hyphen_joins(firstpart: str, secondpart: str) -> bool:
+    """
+    Whether a line that ends with firstpart and a hyphen, and the next line
+    that starts with a hyphen and secondpart, are the two parts of a
+    hyphenated word wrapped at its hyphen, with the hyphen repeated on the
+    next line, as in Polish. The second part of such a word starts with a
+    lowercase letter, unless both parts are capitalized, as in a name such as
+    Bielsko-Biała. Otherwise the next line is probably dialogue that starts
+    with a dash.
+    """
+    first, second = firstpart[:1], secondpart[:1]
+    return second.islower() or (first.isupper() and second.isupper())
+
+
 class Dehyphenator:
     """
     Analyzes words to determine whether hyphens should be retained/removed.  Uses the document
     itself is as a dictionary. This method handles all languages along with uncommon, made-up, and
-    scientific words. The primary disadvantage is that words appearing only once in the document
-    retain hyphens.
+    scientific words. A word split over two lines that appears nowhere else in the document is
+    looked up in the spelling dictionary that recognizes most of the words of the document, if any.
     """
 
-    def __init__(self, verbose: int = 0, log: Log | None = None) -> None:
+    def __init__(self, verbose: int = 0, log: Log | None = None, spelling_dictionary: SpellingDictionary | None = None) -> None:
         self.log = log
         self.verbose = verbose
+        self.spelling_dictionary = SpellingDictionary(log) if spelling_dictionary is None else spelling_dictionary
         # Add common suffixes to the regex below to increase the likelihood of a match -
         # don't add suffixes which are also complete words, such as 'able' or 'sex'
         # only remove if it's not already the point of hyphenation
@@ -228,14 +303,17 @@ class Dehyphenator:
     def dehyphenate(self, match: re.Match[str]) -> str:
         firsthalf = match.group('firstpart')
         secondhalf = match.group('secondpart')
-        try:
-            wraptags = match.group('wraptags') or ''
-        except IndexError:  # the regex for this format has no wraptags group
-            wraptags = ''
+        # The regexes for some formats have no wraptags or repeated group
+        wraptags = match.groupdict().get('wraptags') or ''
         # The ids of tags removed when joining the halves may be link targets
         anchors = anchors_for_ids(wraptags)
         hyphenated = str(firsthalf) + '-' + str(secondhalf)
         dehyphenated = str(firsthalf) + str(secondhalf)
+        if match.groupdict().get('repeated'):
+            # Some languages, such as Polish, repeat the hyphen of a hyphenated word wrapped at it on the next line
+            if self.is_repeated_hyphen(match, wraptags):
+                return anchors + firsthalf + match.group('hyphen') + secondhalf
+            return match.group(0)
         if self.suffixes.match(secondhalf) is None:
             lookupword = self.removesuffixes.sub('', dehyphenated)
         else:
@@ -276,41 +354,84 @@ class Dehyphenator:
             if self.html.find(lookupword) != -1 or searchresult != -1:
                 log('     returned dehyphenated word: ' + dehyphenated)
                 return anchors + dehyphenated
+            elif self.format in ('html', 'pdf', 'txt') and self.in_spelling_dictionary(dehyphenated):
+                log('     returned dehyphenated word found in the spelling dictionary: ' + dehyphenated)
+                return anchors + dehyphenated
             else:
                 log('          returned hyphenated word: ' + hyphenated)
                 return anchors + hyphenated
 
+    def is_repeated_hyphen(self, match: re.Match[str], wraptags: str) -> bool:
+        # Whether the next line starts with the hyphen of a hyphenated word
+        # wrapped at its hyphen, rather than a dash that starts dialogue or an
+        # item of a list
+        if not repeated_hyphen_joins(match.group('firstpart'), match.group('secondpart')):
+            return False
+        is_txt = self.format in {'txt', 'txt_cleanup'}
+        # In plain text a blank line separates paragraphs. In markup, empty
+        # paragraphs are often left over from page breaks, so do not count.
+        if is_txt and '\n\n' in re.sub(r'[ \t]', '', wraptags):
+            return False
+        # A list, unless the next line also ends with a hyphenated word wrapped at its hyphen
+        if (m := (TXT_NEXT_LINE_STARTS_WITH_HYPHEN if is_txt else HTML_NEXT_LINE_STARTS_WITH_HYPHEN).match(match.string, match.end())) is not None:
+            rest_of_line = match.group('secondpart') + (m.group(1) if is_txt else re.sub(r'<[^>]*>', '', m.group(1)))
+            return LINE_END_HYPHEN.search(rest_of_line.rstrip()) is not None
+        return True
+
+    def in_spelling_dictionary(self, word: str) -> bool:
+        # Words that occur only once are not found in the document, so use a dictionary as the PDF engine does
+        if not self.spelling_dictionary_checked:
+            # Once per text, as a text too small to choose the dictionary from
+            # would otherwise be sampled again for every word
+            self.spelling_dictionary_checked = True
+            self.recognized_by_dictionary = self.spelling_dictionary(self.html, self.format != 'txt')
+        if self.recognized_by_dictionary is None:
+            return False
+        try:
+            return self.recognized_by_dictionary(word)
+        except Exception as e:
+            self.spelling_dictionary.log.warning(f'Could not look up {word!r} in the spelling dictionary: {e}')
+            return False
+
     def __call__(self, html: str, format: str, length: int = 1) -> str:
         self.html = html
         self.format = format
+        self.spelling_dictionary_checked = False
+        self.recognized_by_dictionary: Callable[[str], bool] | None = None
         if format == 'html':
             intextmatch = re.compile(
                 (
-                    r'(?<=.{%i})(?P<firstpart>[^\W\-]+)(-|‐)\s*(?=<)(?P<wraptags>(</span>)?'  # ruff: ignore[printf-string-formatting]
+                    r'(?<=.{%i})(?P<firstpart>[^\W\-]+)(?P<hyphen>-|‐)\s*(?=<)(?P<wraptags>(</span>)?'  # ruff: ignore[printf-string-formatting]
                     r'\s*(</[iubp]>\s*){1,2}(?P<up2threeblanks><(p|div)[^>]*>\s*(<p[^>]*>\s*</p>\s*)'
-                    r'?</(p|div)>\s+){0,3}\s*(<[iubp][^>]*>\s*){1,2}(<span[^>]*>)?)\s*(?P<secondpart>[\w\d]+)'
+                    r'?</(p|div)>\s+){0,3}\s*(<[iubp][^>]*>\s*){1,2}(<span[^>]*>)?)\s*(?P<repeated>[-‐](?=[^\W\d_]))?(?P<secondpart>[\w\d]+)'
                 )
                 % length
             )
         elif format == 'pdf':
             intextmatch = re.compile(
                 (
-                    r'(?<=.{%i})(?P<firstpart>[^\W\-]+)(-|‐)\s*(?P<wraptags><p>|'  # ruff: ignore[printf-string-formatting]
-                    r'</[iub]>\s*<p>\s*<[iub]>)\s*(?P<secondpart>[\w\d]+)'
+                    r'(?<=.{%i})(?P<firstpart>[^\W\-]+)(?P<hyphen>-|‐)\s*(?P<wraptags><p>|'  # ruff: ignore[printf-string-formatting]
+                    r'</[iub]>\s*<p>\s*<[iub]>)\s*(?P<repeated>[-‐](?=[^\W\d_]))?(?P<secondpart>[\w\d]+)'
                 )
                 % length
             )
         elif format == 'txt':
-            intextmatch = re.compile(r'(?<=.{%i})(?P<firstpart>[^\W\-]+)(-|‐)( |\t)*(?P<wraptags>(\n( |\t)*)+)(?P<secondpart>[\w\d]+)' % length)  # ruff: ignore[printf-string-formatting]
+            intextmatch = re.compile(
+                (
+                    r'(?<=.{%i})(?P<firstpart>[^\W\-]+)(?P<hyphen>-|‐)( |\t)*(?P<wraptags>(\n( |\t)*)+)'  # ruff: ignore[printf-string-formatting]
+                    r'(?P<repeated>[-‐](?=[^\W\d_]))?(?P<secondpart>[\w\d]+)'
+                )
+                % length
+            )
         elif format == 'individual_words':
-            intextmatch = re.compile(r'(?!<)(?P<firstpart>[^\W\-]+)(-|‐)\s*(?P<secondpart>\w+)(?![^<]*?>)', re.UNICODE)
+            intextmatch = re.compile(r'(?!<)(?P<firstpart>[^\W\-]+)(?P<hyphen>-|‐)\s*(?P<secondpart>\w+)(?![^<]*?>)', re.UNICODE)
         elif format == 'html_cleanup':
             intextmatch = re.compile(
-                r'(?P<firstpart>[^\W\-]+)(-|‐)\s*(?=<)(?P<wraptags></span>\s*(</[iubp]>'
-                r'\s*<[iubp][^>]*>\s*)?<span[^>]*>|</[iubp]>\s*<[iubp][^>]*>)?\s*(?P<secondpart>[\w\d]+)'
+                r'(?P<firstpart>[^\W\-]+)(?P<hyphen>-|‐)\s*(?=<)(?P<wraptags></span>\s*(</[iubp]>'
+                r'\s*<[iubp][^>]*>\s*)?<span[^>]*>|</[iubp]>\s*<[iubp][^>]*>)?\s*(?P<repeated>[-‐](?=[^\W\d_]))?(?P<secondpart>[\w\d]+)'
             )
         elif format == 'txt_cleanup':
-            intextmatch = re.compile(r'(?P<firstpart>[^\W\-]+)(-|‐)(?P<wraptags>\s+)(?P<secondpart>[\w\d]+)')
+            intextmatch = re.compile(r'(?P<firstpart>[^\W\-]+)(?P<hyphen>-|‐)(?P<wraptags>\s+)(?P<repeated>[-‐](?=[^\W\d_]))?(?P<secondpart>[\w\d]+)')
 
         html = intextmatch.sub(self.dehyphenate, html)
         return html
@@ -484,6 +605,9 @@ class HTMLPreProcessor:
         self.extra_opts = extra_opts
         self.regex_wizard_callback = regex_wizard_callback
         self.current_href: str | None = None
+        # Shared by all the files of the book and all dehyphenation passes, so
+        # that the dictionary is chosen only once
+        self.spelling_dictionary = SpellingDictionary(log)
 
     def is_baen(self, src: str) -> bool:
         return re.compile(r'<meta\s+name="Publisher"\s+content=".*?Baen.*?"', re.IGNORECASE).search(src) is not None
@@ -620,7 +744,7 @@ class HTMLPreProcessor:
         if is_pdftohtml and length > -1:
             # Dehyphenate
             assert self.extra_opts is not None
-            dehyphenator = Dehyphenator(self.extra_opts.verbose, self.log)
+            dehyphenator = Dehyphenator(self.extra_opts.verbose, self.log, self.spelling_dictionary)
             html = dehyphenator(html, 'html', length)
 
         if is_pdftohtml:
@@ -653,7 +777,7 @@ class HTMLPreProcessor:
         if getattr(self.extra_opts, 'enable_heuristics', False):
             from calibre.ebooks.conversion.utils import HeuristicProcessor
 
-            preprocessor = HeuristicProcessor(self.extra_opts, self.log)
+            preprocessor = HeuristicProcessor(self.extra_opts, self.log, self.spelling_dictionary)
             html = preprocessor(html)
 
         if is_pdftohtml:

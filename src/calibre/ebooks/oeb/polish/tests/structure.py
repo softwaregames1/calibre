@@ -586,7 +586,9 @@ class Structure(BaseTest):
         self.assertEqual(tuple(s.lang for s in sentences), ('eng', 'fra'))
 
     def test_check_skipped_rules(self) -> None:
-        from calibre.ebooks.oeb.polish.check.css import CSSError, CSSParseError, stylelint_rules_from_skipped_rules
+        from kgcss import LintRule
+
+        from calibre.ebooks.oeb.polish.check.css import CSSError, CSSParseError, disabled_rules_from_skipped_rules
         from calibre.ebooks.oeb.polish.check.main import remove_skipped
         from calibre.ebooks.oeb.polish.check.parsing import DuplicateId, InvalidId, XMLParseError, check_ids
 
@@ -603,17 +605,133 @@ class Structure(BaseTest):
         css_err = CSSError('x', 'a.css')
         css_err.css_rule_id = 'block-no-empty'
         self.assertEqual(css_err.rule_id, 'css:block-no-empty')
-        self.assertEqual(stylelint_rules_from_skipped_rules({'css:block-no-empty', 'InvalidId', 'css:a'}), ('a', 'block-no-empty'))
+        self.assertEqual(
+            disabled_rules_from_skipped_rules({'css:block-no-empty', 'InvalidId', 'css:a', 'css:CssSyntaxError', 'css:no-extra-semicolons'}),
+            {LintRule.BLOCK_NO_EMPTY, LintRule.NO_EXTRA_SEMICOLONS},
+        )
 
         # parse errors can never be skipped
         parse_errors = [XMLParseError('x', 'a.html'), CSSParseError('x', 'a.css')]
         self.assertFalse(any(e.can_be_skipped for e in parse_errors))
         self.assertEqual(remove_skipped(parse_errors, frozenset(e.rule_id for e in parse_errors)), parse_errors)
 
+    def test_check_css_translation(self) -> None:
+        from unittest.mock import patch
+
+        from calibre.ebooks.oeb.polish.check import css as check_css_module
+        from calibre.ebooks.oeb.polish.check.css import Job, check_css
+
+        translations = {
+            'Unknown property "{0}"': 'Propriété inconnue « {0} »',
+            'Unclosed block': 'Bloc non fermé',
+            # A broken translation, falls back to the untranslated message
+            'Duplicate property "{0}"': 'Propriété dupliquée {1}',
+            # Placeholders can be reordered
+            'Overridden property "{1}" by shorthand "{0}"': 'Raccourci « {0} » remplace « {1} »',
+            'Disallow unknown properties': 'Interdire les propriétés inconnues',
+        }
+
+        def translate(msg: str) -> str:
+            return translations.get(msg, msg)
+
+        css = 'a { colr: red; color: red; color: red; margin-top: 1px; margin: 0; } b {'
+        with patch.object(check_css_module, '_', translate), patch.object(check_css_module, 'prints'):
+            errors = check_css([Job('a.css', css)])
+        msgs = {e.msg for e in errors}
+        self.assertIn('Propriété inconnue « colr »', msgs)
+        self.assertIn('Bloc non fermé', msgs)
+        self.assertIn('Duplicate property "color"', msgs)
+        self.assertIn('Raccourci « margin » remplace « margin-top »', msgs)
+        for e in errors:
+            self.assertTrue(e.HELP.startswith(e.msg + '. '), e.HELP)
+        with patch.object(check_css_module, '_', translate):
+            rule_names = {e.rule_name for e in errors}
+        self.assertIn('CSS: Interdire les propriétés inconnues (property-no-unknown)', rule_names)
+        self.assertIn('CSS: Disallow empty blocks (block-no-empty)', rule_names)
+        self.assertIn('CSS: CssSyntaxError', rule_names)
+
+    def test_check_css(self) -> None:
+        from calibre.ebooks.oeb.polish.check.css import CSSError, CSSParseError
+        from calibre.ebooks.oeb.polish.check.main import fix_errors, run_checks
+
+        stylesheet = (
+            'a {}\n'
+            'b { colr: red; color: red;; }\n'
+            # custom elements, panose-1 and consecutive duplicates with different values are allowed
+            'my-element { panose-1: 1; color: red; color: blue }\n'
+            # columns are in UTF-16 code units, as the editor uses them
+            '/* \U0001f600 */ q { colr: red }\n'
+        )
+        page = (
+            '<html xmlns="http://www.w3.org/1999/xhtml">\n'
+            '<head><title>t</title>\n'
+            '<style type="text/css">\n'
+            'p { color: red;; }\n'
+            '</style></head>\n'
+            '<body>\n'
+            '<p style="color: red; colr: blue;;">a</p>\n'
+            '</body></html>'
+        )
+        c = self.create_epub([cmi('s.css', stylesheet), cmi('broken.css', 'a { color: red;;'), cmi('a.xhtml', page)], spine=['a.xhtml'])
+
+        def css_errors(skipped_rules: frozenset[str] = frozenset()) -> list[tuple[str, str, int | None, int | None, bool]]:
+            errors = run_checks(c, skipped_rules)
+            for e in errors:
+                if isinstance(e, CSSError):
+                    self.assertIn(e.msg, e.HELP)
+                    self.assertIn('<a href="https://', e.HELP)
+                    self.assertEqual(e.FIXABLE_CSS_ERROR, 'automatically fixed' in e.HELP)
+            return sorted((e.name, e.rule_id, e.line, e.col, e.FIXABLE_CSS_ERROR) for e in errors if isinstance(e, (CSSError, CSSParseError)))
+
+        errors = run_checks(c)
+        parse_errors = [e for e in errors if isinstance(e, CSSParseError)]
+        self.assertEqual([(e.name, e.msg, e.line, e.col) for e in parse_errors], [('broken.css', 'Unclosed block', 1, 0)])
+        unknown = next(e for e in errors if e.rule_id == 'css:property-no-unknown' and e.name == 's.css')
+        self.assertEqual(unknown.msg, 'Unknown property "colr"')
+        self.assertTrue(all(isinstance(e, CSSError) for e in errors if e.rule_id.startswith('css:') and e not in parse_errors))
+        self.assertEqual(
+            css_errors(),
+            [
+                ('a.xhtml', 'css:no-extra-semicolons', 4, 15, True),
+                ('a.xhtml', 'css:no-extra-semicolons', 7, 23, True),
+                ('a.xhtml', 'css:property-no-unknown', 7, 12, False),
+                ('broken.css', 'css:CssSyntaxError', 1, 0, False),
+                ('broken.css', 'css:no-extra-semicolons', 1, 15, True),
+                ('s.css', 'css:block-no-empty', 1, 2, False),
+                ('s.css', 'css:no-extra-semicolons', 2, 26, True),
+                ('s.css', 'css:property-no-unknown', 2, 4, False),
+                ('s.css', 'css:property-no-unknown', 4, 13, False),
+            ],
+        )
+        # Skipped rules are not checked
+        skipped = frozenset({'css:no-extra-semicolons', 'css:property-no-unknown'})
+        self.assertEqual(
+            css_errors(skipped),
+            [('broken.css', 'css:CssSyntaxError', 1, 0, False), ('s.css', 'css:block-no-empty', 1, 2, False)],
+        )
+        # Fixing honours skipped rules
+        self.assertTrue(fix_errors(c, run_checks(c, frozenset({'css:no-extra-semicolons'})), frozenset({'css:no-extra-semicolons'})))
+        self.assertIn('color: red;;', c.raw_data('s.css'))
+        # Fixable errors are fixed in stylesheets, style elements and style attributes
+        self.assertTrue(fix_errors(c, run_checks(c)))
+        self.assertEqual([e for e in css_errors() if e[-1]], [])
+        self.assertEqual(c.raw_data('s.css'), stylesheet.replace(';;', ';'))
+        # The parse error is fixed by serializing the parsed stylesheet
+        self.assertEqual(c.raw_data('broken.css').split(), ['a', '{', 'color:', 'red;', '}'])
+        root = c.parsed('a.xhtml')
+        self.assertEqual(root.xpath('//*[local-name()="style"]')[0].text, '\np { color: red; }\n')
+        self.assertEqual(root.xpath('//*[@style]')[0].get('style'), 'color: red; colr: blue;')
+        # The simplest case
+        c = self.create_epub([cmi('a.css', 'a{color:red;;}')])
+        self.assertTrue(fix_errors(c, run_checks(c)))
+        self.assertEqual(c.raw_data('a.css'), 'a{color:red;}')
+        self.assertEqual(css_errors(), [])
+
     def test_invalid_id_fix(self) -> None:
+        from kgcss import rename_ids
+
         from calibre.ebooks.oeb.polish.check.main import fix_errors
         from calibre.ebooks.oeb.polish.check.parsing import InvalidId, check_ids, make_valid_id
-        from calibre.ebooks.oeb.polish.css import rename_ids_in_selector
 
         self.assertEqual(make_valid_id('_x', set()), 'id_x')
         self.assertEqual(make_valid_id('1 a', {'id1_a'}), 'id1_a-2')
@@ -627,7 +745,7 @@ class Structure(BaseTest):
             '[id="_x"], [ id = _x ], [id~="_x"], [data-a="_x"]': '[id="id_x"], [ id = "id_x" ], [id~="_x"], [data-a="_x"]',
             '#_x.c /* c */ i': '#id_x.c /* c */ i',
         }.items():
-            self.assertEqual(rename_ids_in_selector(selector, id_map), expected)
+            self.assertEqual(rename_ids(selector, id_map), expected)
 
         def html(body: str, head: str = '') -> str:
             return f'''<html xmlns="http://www.w3.org/1999/xhtml"><head><link rel="stylesheet" href="style.css"/>{head}</head><body>{body}</body></html>'''
@@ -665,6 +783,59 @@ class Structure(BaseTest):
         self.assertEqual(root.xpath('//*/@aria-labelledby'), [f'{nid} _y'])
         self.assertEqual(root.xpath('//*/@aria-describedby'), [nid])
         self.assertEqual(root.xpath('//*/@for'), [nid])
+
+    def test_css_transform_rules_on_container(self) -> None:
+        from calibre.ebooks.css_transform_rules import transform_container
+
+        html = (
+            '<html xmlns="http://www.w3.org/1999/xhtml"><head><link rel="stylesheet" href="s.css"/><style>p { color: red }</style></head>'
+            '<body><p style="color: red; margin: 0">a</p></body></html>'
+        )
+        c = self.create_epub([cmi('a.html', html), cmi('s.css', '#\\31 x { color: red } @media screen { p { color: red } }')])
+        rules = [{'property': 'color', 'match_type': 'is', 'query': 'red', 'action': 'change', 'action_data': 'blue'}]
+        self.assertTrue(transform_container(c, rules))
+        sheet = c.parsed('s.css')
+        self.assertEqual(sheet.cssRules[1].cssRules[0].style.getPropertyValue('color'), 'blue')
+        self.assertEqual(sheet.cssRules[0].style.getPropertyValue('color'), 'blue')
+        root = c.parsed('a.html')
+        self.assertIn('blue', root.xpath('//*[local-name()="style"]')[0].text)
+        self.assertEqual(root.xpath('//*[local-name()="p"]/@style'), ['color: blue; margin: 0'])
+        self.assertFalse(transform_container(c, rules))
+
+    def test_report_css_data(self) -> None:
+        from calibre.ebooks.oeb.polish.report import ClassEntry, css_data
+        from calibre.spell import parse_lang_code
+
+        html = (
+            '<html xmlns="http://www.w3.org/1999/xhtml"><head><link rel="stylesheet" href="s.css"/><style>.Inline { color: red }</style></head>'
+            '<body><p id="1x" class="A b">a</p><p class="b">b</p><a href="#">l</a></body></html>'
+        )
+        css = (
+            '#\\31 x { color: red }\n.a { color: blue }\np.B, a:hover { margin: 0 }\na[x!=y] { color: green }\n'
+            '@media screen { body > p { font-weight: bold } }\n.missing { color: red }'
+        )
+        c = self.create_epub([cmi('a.html', html), cmi('s.css', css)])
+        result_data: dict[str, object] = {}
+        counts = {e.rule.selector: e.count for e in css_data(c, parse_lang_code('en'), result_data)}
+        self.assertEqual(
+            counts,
+            {
+                # Escapes in selectors work
+                '#\\31 x': 1,
+                # Ids and classes match case-insensitively, as with css_selectors
+                '.a': 1,
+                # Pseudo-classes that need user interaction are ignored
+                'p.B, a:hover': 3,
+                # Invalid selectors match nothing
+                'a[x!=y]': 0,
+                'body > p': 2,
+                '.missing': 0,
+                '.Inline': 0,
+            },
+        )
+        classes = result_data['classes']
+        assert isinstance(classes, list)
+        self.assertEqual({e.cls: e.num_of_matches for e in classes if isinstance(e, ClassEntry)}, {'A': 1, 'b': 2})
 
     def test_batch_fixes(self) -> None:
         "Test that fixing errors in batches gives the same result as fixing them one by one"
@@ -735,6 +906,105 @@ class Structure(BaseTest):
             self.assertEqual([str(e) for e in check_link_destinations(batched)], [])
             self.assertIn('c.html#id3x', batched.parsed('b.html').xpath('//*[local-name()="a"]/@href'))
             self.assertFalse(fix_errors(batched, order(initial)))
+
+    def test_fix_errors_with_renamed_files(self) -> None:
+        "Fixes that rename files must not break other fixes for the same files"
+        from calibre.ebooks.oeb.polish.check.main import fix_errors, run_checks
+        from calibre.ebooks.oeb.polish.replace import rename_files
+
+        def html(body: str) -> str:
+            return f'<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head><body>{body}</body></html>'
+
+        # .html files get the text/html MIME type, which is a MimetypeMismatch
+        # in EPUB, whose fix renames the file
+        c = self.create_epub([cmi('a.html', html('<p id="1x">a</p><a href="#1x">l</a><a href="B.html">c</a>')), cmi('b.html', html('<p>b</p>'))], ver=2)
+        errors = run_checks(c)
+        self.assertTrue(any(type(e).renames_file for e in errors))
+        self.assertTrue(fix_errors(c, errors))
+        fixed_types = {type(e) for e in errors if e.INDIVIDUAL_FIX}
+        self.assertEqual([str(e) for e in run_checks(c) if type(e) in fixed_types], [])
+        self.assertEqual(sorted(n for n in c.mime_map if n.endswith('html')), ['a.xhtml', 'b.xhtml'])
+        a = c.parsed('a.xhtml')
+        self.assertEqual(a.xpath('//*[local-name()="a"]/@href'), ['#id1x', 'b.xhtml'])
+
+        # A file that needs two renames, once to fix its MIME type and once to
+        # fix its name. The second rename must be skipped, not crash.
+        c = self.create_epub([cmi('c.html', html('<p id="1x">a</p>'))], ver=2)
+        rename_files(c, {'c.html': 'c+.html'})  # not in create_epub() as it uses names as ids
+        errors = run_checks(c)
+        self.assertEqual({type(e).__name__ for e in errors if type(e).renames_file}, {'MimetypeMismatch', 'EscapedName'})
+        self.assertTrue(fix_errors(c, errors))
+        self.assertEqual(sorted(n for n in c.mime_map if n.endswith('html')), ['c+.xhtml'])
+        self.assertTrue(fix_errors(c, run_checks(c)))
+        self.assertEqual(sorted(n for n in c.mime_map if n.endswith('html')), ['c_.xhtml'])
+
+    def test_fix_errors_with_invalid_manifest_id(self) -> None:
+        "Fixes for spine items must not depend on manifest ids changed by earlier fixes"
+        from calibre.ebooks.oeb.polish.check.main import fix_errors, run_checks
+        from calibre.ebooks.oeb.polish.check.opf import BadSpineMime
+        from calibre.ebooks.oeb.polish.check.parsing import InvalidId
+
+        # create_epub() uses names as manifest ids, and c+.html is not a valid id
+        c = self.create_epub([cmi('c+.html', '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head><body><p>c</p></body></html>')], ver=2)
+        errors = run_checks(c)
+        self.assertTrue(any(isinstance(e, InvalidId) and e.name == c.opf_name for e in errors))
+        self.assertTrue(any(isinstance(e, BadSpineMime) for e in errors))
+        self.assertTrue(fix_errors(c, errors))
+        self.assertEqual([str(e) for e in run_checks(c) if isinstance(e, (BadSpineMime, InvalidId))], [])
+        items = c.opf_xpath('//opf:manifest/opf:item')
+        self.assertEqual(len(items), 1)
+        self.assertNotEqual(items[0].get('id'), 'c+.html')
+        self.assertEqual(items[0].get('media-type'), 'application/xhtml+xml')
+
+    def test_links_in_svg(self) -> None:
+        "Links in SVG images are found, checked and replaced"
+        from calibre.ebooks.oeb.polish.check.links import DanglingLink, UnreferencedResource, check_links
+        from calibre.ebooks.oeb.polish.replace import rename_files
+        from calibre.ebooks.oeb.polish.report import images_data
+
+        html = '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head><body><img src="i.svg" alt="i"/></body></html>'
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">'
+            '<style>rect { fill: url(styled.png) }</style>'
+            '<image xlink:href="in_svg.png"/><image href="nested.svg"/><image href="missing.png"/><rect/></svg>'
+        )
+        nested = '<svg xmlns="http://www.w3.org/2000/svg"><image href="in_nested.png"/></svg>'
+        c = self.create_epub([
+            cmi('a.xhtml', html),
+            cmi('i.svg', svg),
+            cmi('nested.svg', nested),
+            cmi('in_svg.png'),
+            cmi('styled.png'),
+            cmi('in_nested.png'),
+            cmi('unused.svg', '<svg xmlns="http://www.w3.org/2000/svg"><image href="only_unused.png"/></svg>'),
+            cmi('only_unused.png'),
+        ])
+        self.assertEqual({x[0] for x in c.iterlinks('i.svg')}, {'styled.png', 'in_svg.png', 'nested.svg', 'missing.png'})
+        errors = check_links(c)
+        unreferenced = sorted(e.name for e in errors if isinstance(e, UnreferencedResource))
+        self.assertEqual(unreferenced, ['only_unused.png', 'unused.svg'])
+        self.assertEqual([(e.name, e.target_name) for e in errors if isinstance(e, DanglingLink)], [('i.svg', 'missing.png')])
+        dangling = [e for e in errors if isinstance(e, DanglingLink)]
+        self.assertTrue(DanglingLink.fix_batch(c, dangling))
+        self.assertNotIn('missing.png', {x[0] for x in c.iterlinks('i.svg')})
+        self.assertFalse([e for e in check_links(c) if isinstance(e, DanglingLink)])
+        usage = {img.name: {loc.name for loc in img.usage} for img in images_data(c)}
+        self.assertEqual(usage['in_svg.png'], {'i.svg'})
+        self.assertEqual(usage['in_nested.png'], {'nested.svg'})
+
+        # Renaming files referenced from SVG images updates the links in them
+        rename_files(c, {'in_svg.png': 'images/in_svg.png', 'nested.svg': 'images/nested.svg', 'in_nested.png': 'in_nested2.png'})
+        self.assertEqual({x[0] for x in c.iterlinks('i.svg')}, {'styled.png', 'images/in_svg.png', 'images/nested.svg'})
+        self.assertEqual({x[0] for x in c.iterlinks('images/nested.svg')}, {'../in_nested2.png'})
+        c.commit_item('i.svg', keep_parsed=False)
+        self.assertIn('xlink:href="images/in_svg.png"', c.raw_data('i.svg'))
+        self.assertEqual(sorted(e.name for e in check_links(c) if isinstance(e, UnreferencedResource)), ['only_unused.png', 'unused.svg'])
+
+        # A broken SVG image does not prevent processing other files
+        c = self.create_epub([cmi('a.xhtml', html), cmi('i.svg', b'\0'), cmi('p.png')])
+        self.assertEqual(list(c.iterlinks('i.svg')), [])
+        rename_files(c, {'p.png': 'q.png'})
+        self.assertIn('q.png', c.mime_map)
 
     def test_dangling_id_reference(self) -> None:
         from calibre.ebooks.oeb.polish.check.main import fix_errors
